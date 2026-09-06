@@ -1,0 +1,20 @@
+name = "tamsaek-worker"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+# 탐색팩(tamsaekPack)용 검색 그라운딩 + AI 이미지 워커.
+# 배포:      npx wrangler deploy
+# 로컬 시험: npx wrangler dev
+#
+# (선택) 비밀키 인증 — 등록하면 모든 /api/* 요청에 X-AIBP-Secret 헤더 필요:
+#   npx wrangler secret put WORKER_SECRET
+# 같은 값을 탐색팩 AI 글쓰기 설정의 "Worker 비밀키" 칸에 넣으면 된다.
+
+[observability]
+enabled = false
+
+# Workers AI 바인딩 — /api/image 가 실제 AI 이미지를 만들 때 필요.
+# 무료 플랜에서도 하루 일정량(뉴런)까지 무료로 쓸 수 있다.
+# 검색(/api/search)만 쓸 거라면 아래 두 줄을 지워도 된다.
+[ai]
+binding = "AI"
