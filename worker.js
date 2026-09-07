@@ -6,6 +6,7 @@
  *
  * 라우트:
  *   GET      /api/search?q={검색어}&engine=all|naver|daum|bing|google&start=0
+ *   POST     /api/research { query, max_results? } — 썸네일용 주제 조사(JSON)
  *   GET/POST /api/image   { prompt, topic?, style?, width?, height? }
  *   GET      /            간단 안내 페이지
  *
@@ -266,16 +267,278 @@ async function handleSearch(request) {
   return json({ query: q, engine, start, providers });
 }
 
-/* ── /api/image ─────────────────────────────────────
-   Workers AI 바인딩(env.AI)이 있으면 이미지 모델을 순서대로 시도한다.
-   모두 실패하면(바인딩 없음 포함) 항상 성공하는 SVG 카드로 폴백해
-   호출 측이 절대 빈손이 되지 않게 한다. */
+/* ── /api/research ──────────────────────────────────
+   썸네일 전용 "주제 조사": 검색(기존 엔진 재활용) → 규칙 기반 분석으로
+   주제의 실제 의미·시각 요소·색감을 JSON으로 만든다. 프롬프트를 짓는
+   Gemini(플러그인 쪽)가 주제 문자열만 보고 엉뚱하게 해석하는 것을 막는 용도.
+   Workers AI 바인딩이 있으면 소형 텍스트 모델을 요청당 딱 1회, 짧게 호출해
+   정성 필드만 보강하고, 없거나 실패하면 항상 규칙 기반 결과를 반환한다. */
 
-const IMAGE_MODELS = [
-  { id: "@cf/black-forest-labs/flux-1-schnell", input: (p) => ({ prompt: p, steps: 8 }) },
-  { id: "@cf/bytedance/stable-diffusion-xl-lightning", input: (p, w, h) => ({ prompt: p, width: w, height: h }) },
-  { id: "@cf/lykon/dreamshaper-8-lcm", input: (p, w, h) => ({ prompt: p, width: w, height: h }) },
+const RESEARCH_COLOR_HINTS = [
+  { words: ["빨강", "레드", "붉은", "적색"], mood: "정열적이고 강렬한 붉은 톤", text: "#FFFFFF", accent: "#E4342F" },
+  { words: ["파랑", "블루", "푸른", "네이비", "청색"], mood: "차분하고 신뢰감 있는 파란 톤", text: "#FFFFFF", accent: "#2F6FE4" },
+  { words: ["초록", "그린", "녹색", "연두"], mood: "자연스럽고 신선한 초록 톤", text: "#FFFFFF", accent: "#2FA84F" },
+  { words: ["노랑", "옐로", "골드", "금색"], mood: "밝고 경쾌한 노란·골드 톤", text: "#1A1A1A", accent: "#FFD400" },
+  { words: ["보라", "퍼플", "라벤더"], mood: "신비롭고 세련된 보라 톤", text: "#FFFFFF", accent: "#8B5CF6" },
+  { words: ["분홍", "핑크", "로즈"], mood: "부드럽고 따뜻한 핑크 톤", text: "#1A1A1A", accent: "#F472B6" },
+  { words: ["검정", "블랙", "다크"], mood: "묵직하고 고급스러운 다크 톤", text: "#FFFFFF", accent: "#F2F2F2" },
+  { words: ["흰색", "화이트", "미니멀"], mood: "깨끗하고 여백이 넓은 화이트 톤", text: "#1A1A1A", accent: "#111111" },
 ];
+
+/* 카드 심볼용 카테고리 키(영문)를 조사 결과용 한글 라벨·정서 톤으로 변환.
+   사전을 이중으로 두지 않고 CATEGORY_KEYWORDS 하나를 공유한다. */
+const RESEARCH_CATEGORY_META = {
+  messenger: { label: "메신저/앱", tone: "modern" },
+  device: { label: "IT/기기", tone: "modern" },
+  finance: { label: "재테크/금융", tone: "trustworthy" },
+  food: { label: "푸드", tone: "warm" },
+  travel: { label: "여행", tone: "warm" },
+  health: { label: "건강/피트니스", tone: "energetic" },
+  education: { label: "교육", tone: "trustworthy" },
+  beauty: { label: "뷰티/패션", tone: "elegant" },
+  business: { label: "비즈니스/커리어", tone: "energetic" },
+  environment: { label: "자연/반려동물", tone: "warm" },
+  entertainment: { label: "엔터테인먼트", tone: "dynamic" },
+  legal: { label: "법률/제도", tone: "serious" },
+  home: { label: "리빙/인테리어", tone: "warm" },
+  tech: { label: "IT/기술", tone: "modern" },
+  default: { label: "일반", tone: "dynamic" },
+};
+
+const PEOPLE_WORDS_EN = /\b(person|people|woman|women|man|men|girl|boy|human|face|portrait|model)\b/gi;
+const PEOPLE_WORDS_KO = /(사람|인물|모델|여성|남성|얼굴)/g;
+
+function stripPeopleWords(s) {
+  return String(s || "").replace(PEOPLE_WORDS_KO, "").replace(PEOPLE_WORDS_EN, "").replace(/\s{2,}/g, " ").trim();
+}
+
+/* 검색 결과(제목+스니펫)를 규칙 기반으로 분석해 research JSON을 만든다.
+   AI 바인딩이 전혀 없어도 항상 완전한 결과를 반환한다. */
+function buildRuleBasedResearch(topic, flatResults) {
+  const corpus = [topic]
+    .concat(flatResults.slice(0, 8).map((r) => `${r.title || ""} ${r.snippet || ""}`))
+    .join(" ")
+    .toLowerCase();
+
+  let colorEntry = null;
+  for (const entry of RESEARCH_COLOR_HINTS) {
+    if (entry.words.some((w) => corpus.includes(w))) { colorEntry = entry; break; }
+  }
+  const categoryKey = detectCategory(corpus);
+  const categoryMeta = RESEARCH_CATEGORY_META[categoryKey] || RESEARCH_CATEGORY_META.default;
+
+  const topTitles = flatResults.slice(0, 5).map((r) => r.title).filter(Boolean);
+  const topSnippets = flatResults.slice(0, 3).map((r) => r.snippet).filter(Boolean);
+
+  // 실제 의미: 정보량이 적당한 검색 결과 제목을 붙여 주제의 실체를 드러낸다.
+  const bestTitle = topTitles.find((t) => t.length >= 6 && t.length <= 60) || topTitles[0] || "";
+  const actualMeaning = (bestTitle ? `${topic} — ${bestTitle}` : topic).slice(0, 160);
+
+  // 스니펫 앞의 날짜/숫자 찌꺼기("2026.07.14." 등)를 걷어내고, 내용이 충분한
+  // 스니펫만 시각적 맥락으로 채택한다.
+  const cleanedSnippets = topSnippets
+    .map((s) => stripPeopleWords(s).replace(/^[\s\d.,~\-:년월일()]+/, "").trim())
+    .filter((s) => s.length >= 20);
+  const visualContext = (cleanedSnippets[0]
+    || stripPeopleWords(topTitles.slice(0, 3).join(", "))
+    || topic).slice(0, 160);
+
+  const keyVisuals = Array.from(new Set(
+    topTitles.join(" ").split(/[\s,·|\-\/]+/)
+      .map((w) => w.trim())
+      .filter((w) => w.length >= 2 && w.length <= 12
+        && !/(사람|인물|모델|여성|남성|얼굴)/.test(w)
+        && !/^\d/.test(w) && !/^[\d.,~%년월일회차:()]+$/.test(w))
+  )).slice(0, 5);
+
+  return {
+    actual_meaning: actualMeaning,
+    visual_context: visualContext || topic,
+    hero_shot: keyVisuals[0] ? `${keyVisuals[0]}을(를) 중심으로 한 상징적 장면` : `${topic}을(를) 상징하는 오브젝트 중심 장면`,
+    color_mood: colorEntry ? colorEntry.mood : "주제와 어울리는 현대적이고 선명한 톤",
+    key_visuals: keyVisuals.length ? keyVisuals : [topic],
+    category: categoryMeta.label,
+    emotional_tone: categoryMeta.tone,
+    text_color_hex: colorEntry ? colorEntry.text : "#FFFFFF",
+    accent_color_hex: colorEntry ? colorEntry.accent : "#FFD400",
+    research_engine: "rule_based",
+  };
+}
+
+/* (선택) Workers AI 소형 텍스트 모델로 정성 필드만 보강 — 요청당 1회,
+   짧은 프롬프트 + 짧은 max_tokens + 6초 제한. 실패 시 규칙 기반 결과 유지. */
+async function enhanceResearchWithAI(env, topic, flatResults, ruleBased, debug) {
+  const fail = (why) => {
+    if (debug) ruleBased._ai_skip = why; // debug:true 요청에서만 노출되는 진단 필드
+    return ruleBased;
+  };
+  if (!env || !env.AI || typeof env.AI.run !== "function") return fail("no_ai_binding");
+  const snippets = flatResults.slice(0, 5)
+    .map((r) => `- ${r.title || ""}: ${String(r.snippet || "").slice(0, 120)}`)
+    .join("\n");
+  if (!snippets) return fail("no_snippets");
+
+  const prompt = `다음은 "${topic}"에 대한 검색 결과 요약이다. 아래 JSON 스키마로만, 마크다운이나 설명 없이 응답하라.
+검색 결과:
+${snippets}
+
+스키마:
+{"actual_meaning":"주제의 실제 의미(최대 40자)","visual_context":"이미지로 표현할 시각적 장면(최대 60자)","hero_shot":"핵심 장면 한 문장","color_mood":"어울리는 색상 분위기","category":"카테고리 한 단어","emotional_tone":"영어 한 단어(예: warm, dynamic, trustworthy)"}
+인물/사람을 시각 요소로 넣지 말 것.`;
+
+  /* 저비용 소형 텍스트 모델 체인 — 앞 모델이 퇴역(5028)·실패·지연되면 다음
+     모델로. 모델마다 개별 6초 제한을 둔다.
+     (2026-09 카탈로그 실측: llama-3.1-8b-instruct는 퇴역됨 → 현행 모델 사용) */
+  const textModels = [
+    "@cf/meta/llama-3.1-8b-instruct-fp8", // 빠르고 저렴 — 1순위
+    "@cf/meta/llama-3.2-3b-instruct",     // 예비(최저 비용)
+    "@cf/zai-org/glm-4.7-flash",          // 다국어 예비
+  ];
+  try {
+    let raw = "";
+    let lastErr = "";
+    for (const model of textModels) {
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort("ai_timeout"), 6000);
+      try {
+        const result = await env.AI.run(model, {
+          messages: [{ role: "user", content: prompt }],
+          max_tokens: 220,
+        }, { signal: ac.signal });
+        raw = typeof result === "string" ? result : ((result && result.response) || "");
+        if (raw) break;
+      } catch (e) {
+        lastErr = String((e && e.message) || e).slice(0, 120);
+      } finally {
+        clearTimeout(t);
+      }
+    }
+    if (!raw) return fail("ai_error: " + (lastErr || "empty_response"));
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return fail("no_json_in_response: " + String(raw).slice(0, 80));
+    const parsed = JSON.parse(match[0]);
+    // 소형 모델이 지나치게 짧거나 형식이 어긋난 값을 주면 그 필드는 규칙
+    // 기반 값을 유지한다 (AI는 "있으면 좋은 보강"일 뿐 절대 후퇴는 없어야 함).
+    const pick = (key, max, strip, minLen) => {
+      if (!parsed[key]) return ruleBased[key];
+      const v = strip ? stripPeopleWords(String(parsed[key])) : String(parsed[key]).trim();
+      return v && v.length >= minLen ? v.slice(0, max) : ruleBased[key];
+    };
+    const tone = String(parsed.emotional_tone || "").trim();
+    return {
+      ...ruleBased,
+      actual_meaning: pick("actual_meaning", 160, false, 8),
+      visual_context: pick("visual_context", 200, true, 10),
+      hero_shot: pick("hero_shot", 200, true, 10),
+      color_mood: pick("color_mood", 100, false, 6),
+      category: pick("category", 40, false, 2),
+      // emotional_tone은 영어 한 단어 형식일 때만 채택.
+      emotional_tone: /^[a-z]{3,20}$/i.test(tone) ? tone.toLowerCase() : ruleBased.emotional_tone,
+      research_engine: "workers_ai+rule_based",
+    };
+  } catch (e) {
+    return fail("ai_error: " + String((e && e.message) || e).slice(0, 120));
+  }
+}
+
+async function handleResearch(request, env) {
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "요청 본문이 유효한 JSON이 아닙니다." }, 400);
+  }
+  const query = String(body.query || body.topic || body.q || "").trim().slice(0, 200);
+  if (!query) return json({ error: "query가 필요합니다." }, 400);
+  const maxResults = Math.max(3, Math.min(10, parseInt(body.max_results, 10) || 8));
+
+  // 빠른 엔진 3곳만 병렬 조사(뉴스 RSS는 조사 목적상 기여도가 낮고 느릴 수 있어 제외).
+  const names = ["naver", "daum", "bing"];
+  const settled = await Promise.allSettled(names.map((n) => runEngine(n, query, 0)));
+  const providers = settled.map((s, i) => s.status === "fulfilled"
+    ? s.value
+    : { engine: names[i], label: ENGINES[names[i]].label, upstream_status: 599, latency_ms: 0, results: [] });
+
+  const flatResults = dedupe(providers.flatMap((p) => p.results || []), maxResults);
+  const summary = flatResults.slice(0, 6).map((r) => r.title).filter(Boolean).join(" / ");
+
+  const ruleBased = buildRuleBasedResearch(query, flatResults);
+  const research = await enhanceResearchWithAI(env, query, flatResults, ruleBased, Boolean(body.debug));
+
+  return json({ query, summary, results: flatResults, providers, research });
+}
+
+/* ── /api/image ─────────────────────────────────────
+   Workers AI 바인딩(env.AI)이 있으면 스타일별 모델 체인을 순서대로 시도한다.
+   모두 실패하면(바인딩 없음 포함) 항상 성공하는 SVG 카드로 폴백해
+   호출 측이 절대 빈손이 되지 않게 한다.
+
+   ⚠️ 뉴런 최소화 원칙: 각 스타일 체인의 1순위는 항상 스텝 수가 적어 뉴런
+   소모가 가장 적은 모델(schnell/lightning/dreamshaper, 4~8스텝)로 고정한다.
+   대부분의 요청이 1순위에서 성공하므로 실사용 비용은 저비용 모델에 집중되고,
+   고스텝 모델(SDXL base 20스텝)은 앞이 실패했을 때만 도달하는 안전망이다.
+   각 모델은 재시도 없이 1회씩만 시도한다. */
+
+const AI_MODELS = {
+  FLUX_SCHNELL: "@cf/black-forest-labs/flux-1-schnell",          // 4스텝, 최저 비용, 자연문 지시 이행 우수
+  SDXL_BASE: "@cf/stabilityai/stable-diffusion-xl-base-1.0",     // 20스텝, 고품질/고비용, negative_prompt 지원
+  SDXL_LIGHTNING: "@cf/bytedance/stable-diffusion-xl-lightning", // 8스텝, 빠르고 대비 강함, negative_prompt 지원
+  DREAMSHAPER: "@cf/lykon/dreamshaper-8-lcm",                    // 6스텝, 사실적 렌더링 강점, 저비용
+};
+
+/* 스타일별 모델 체인 — 플러그인이 보내는 style(poster/minimal/typography/
+   branding/photo_realistic)마다 그 스타일의 디자인 철학에 맞는 우선순위를 둔다. */
+const STYLE_MODEL_CHAIN = {
+  // 포스터: 강한 대비·인쇄 광고풍 마감이 강점인 Lightning을 1순위로,
+  // 폭넓은 구도 표현을 위해 서로 다른 계열을 두루 포함.
+  poster: [AI_MODELS.SDXL_LIGHTNING, AI_MODELS.FLUX_SCHNELL, AI_MODELS.DREAMSHAPER, AI_MODELS.SDXL_BASE],
+  // 브랜딩: 상업 광고급 대비의 Lightning 우선, 디테일 안전망으로 SDXL base.
+  branding: [AI_MODELS.SDXL_LIGHTNING, AI_MODELS.FLUX_SCHNELL, AI_MODELS.SDXL_BASE],
+  // 미니멀: 과도한 디테일을 만드는 고스텝 모델은 철학에 어긋나므로
+  // 저스텝·깔끔한 지시 이행 모델로만 짧게 구성.
+  minimal: [AI_MODELS.FLUX_SCHNELL, AI_MODELS.SDXL_LIGHTNING],
+  // 타이포그래피: 배경은 텍스트를 위한 무대 — 단순 배경에 강한 저비용 모델
+  // 우선, 감성적 색조 표현용으로 SDXL 계열을 안전망에 둔다.
+  typography: [AI_MODELS.FLUX_SCHNELL, AI_MODELS.SDXL_LIGHTNING, AI_MODELS.SDXL_BASE],
+  // 사실적 사진: 사실적 렌더링에 강한 Dreamshaper 1순위, 사실성 실패 시
+  // 품질 저하가 가장 두드러지는 스타일이라 폴백 단계를 가장 넓게 둔다.
+  photo_realistic: [AI_MODELS.DREAMSHAPER, AI_MODELS.SDXL_LIGHTNING, AI_MODELS.SDXL_BASE, AI_MODELS.FLUX_SCHNELL],
+};
+
+/* 모델 계열별 프롬프트 가공 — 계열마다 프롬프트 문법이 다르다.
+   - FLUX 계열: 자연스러운 문장 묘사를 선호, 가중치 문법·negative_prompt 미지원 → 그대로.
+   - Stable Diffusion 계열(SDXL base/lightning): 품질 태그를 덧붙이면 효과가
+     있고 negative_prompt를 지원한다.
+   - dreamshaper(LCM): 소수 스텝에 최적화 — 긴 프롬프트보다 핵심 묘사 위주가 안정적. */
+function buildModelPrompt(model, prompt, style) {
+  switch (model) {
+    case AI_MODELS.SDXL_BASE:
+    case AI_MODELS.SDXL_LIGHTNING:
+      return `${prompt}, professional commercial ${style} design, sharp focus, high detail, studio quality lighting, 4k`;
+    case AI_MODELS.DREAMSHAPER:
+      return `${prompt}, clean composition, balanced lighting, crisp detail`;
+    default:
+      return prompt;
+  }
+}
+
+function buildModelInput(model, prompt, style, w, h) {
+  const shaped = buildModelPrompt(model, prompt, style);
+  // negative_prompt는 Stable Diffusion 계열만 지원한다.
+  const negative = "blurry, low quality, watermark, text artifacts, distorted, extra limbs, deformed";
+  switch (model) {
+    case AI_MODELS.SDXL_BASE:
+      return { prompt: shaped, negative_prompt: negative, num_steps: 20, guidance: 7.5, width: w, height: h };
+    case AI_MODELS.SDXL_LIGHTNING:
+      return { prompt: shaped, negative_prompt: negative, num_steps: 8, width: w, height: h };
+    case AI_MODELS.DREAMSHAPER:
+      return { prompt: shaped, num_steps: 6, guidance: 2, width: w, height: h };
+    case AI_MODELS.FLUX_SCHNELL:
+    default:
+      // schnell 권장값(4스텝)을 넘기지 않는다 — 뉴런 남용 방지. 크기 파라미터는 미지원(항상 1024급).
+      return { prompt: shaped, steps: 4 };
+  }
+}
 
 function bytesToBase64(bytes) {
   let bin = "";
@@ -292,11 +555,11 @@ function sniffMime(b64) {
   return "image/png";
 }
 
-async function tryModel(env, model, prompt, w, h) {
+async function tryModel(env, modelId, input) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort("timeout"), 30000);
   try {
-    const res = await env.AI.run(model.id, model.input(prompt, w, h), { signal: ac.signal });
+    const res = await env.AI.run(modelId, input, { signal: ac.signal });
     let b64 = null;
     if (res && typeof res.image === "string" && res.image.length > 100) {
       b64 = res.image;
@@ -318,32 +581,380 @@ async function tryModel(env, model, prompt, w, h) {
   }
 }
 
-/* 최후 폴백: 주제 문구를 얹은 그라디언트 SVG 카드(외부 의존 없음, 항상 성공). */
-export function fallbackSvg(topic, width = 1024, height = 1024) {
+/* ── 최후 폴백: SVG 카드 렌더러 ─────────────────────
+   AI 모델이 전부 실패해도(바인딩 없음 포함) 항상 성공하는 디자인 카드.
+   스타일별로 색상·패널 기하·타이포 스케일을 다르게 두고, 주제의 카테고리를
+   추정해 심볼을 얹어 "모든 주제가 똑같은 카드"로 보이는 문제를 완화한다. */
+
+function hashString(input) {
   let hash = 5381;
-  const s = String(topic || "thumbnail");
+  const s = String(input || "");
   for (let i = 0; i < s.length; i++) hash = ((hash << 5) + hash + s.charCodeAt(i)) >>> 0;
-  const hue = hash % 360;
-  const hue2 = (hue + 40 + (hash >> 8) % 60) % 360;
-  const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[c]));
-  const chars = [...s.slice(0, 48)];
-  const lines = [];
-  for (let i = 0; i < chars.length && lines.length < 3; i += 14) lines.push(chars.slice(i, i + 14).join(""));
-  const tspans = lines.map((l, i) => `<tspan x="${width / 2}" dy="${i === 0 ? 0 : 90}">${esc(l)}</tspan>`).join("");
-  const startY = height / 2 - (lines.length - 1) * 45;
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
-<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-<stop offset="0" stop-color="hsl(${hue},62%,30%)"/><stop offset="1" stop-color="hsl(${hue2},70%,16%)"/>
-</linearGradient></defs>
-<rect width="${width}" height="${height}" fill="url(#g)"/>
-<circle cx="${(hash % width)}" cy="${height - 140}" r="300" fill="hsl(${hue2},80%,55%)" opacity="0.14"/>
-<circle cx="${width - (hash >> 4) % 300}" cy="120" r="200" fill="hsl(${hue},85%,65%)" opacity="0.12"/>
-<text x="${width / 2}" y="${startY}" text-anchor="middle" font-family="'Apple SD Gothic Neo','Malgun Gothic','Noto Sans KR',sans-serif" font-size="76" font-weight="800" fill="#ffffff">${tspans}</text>
-</svg>`;
-  const b64 = btoa(String.fromCharCode(...new TextEncoder().encode(svg)));
-  return { b64, mime: "image/svg+xml" };
+  return hash;
 }
 
+function escapeXml(v = "") {
+  return String(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[c]));
+}
+
+/**
+ * 문자 1개의 대략적인 렌더 폭을 em(폰트 크기 대비 배수) 단위로 추정한다.
+ * Workers 런타임에는 폰트 metrics 측정 수단이 없으므로 문자 종류별 평균 폭을
+ * 근사값으로 쓴다. 제목이 굵게(font-weight 800) 그려지는 점을 감안해 실제
+ * 평균보다 넉넉히 잡아, 추정이 어긋나도 "넘치는" 대신 "일찍 접히는" 쪽으로만
+ * 오차가 나게 한다.
+ */
+function estCharWidthEm(ch) {
+  if (/[가-힣]/.test(ch)) return 1.05;
+  if (/[A-Z0-9]/.test(ch)) return 0.68;
+  if (/[a-z]/.test(ch)) return 0.60;
+  if (ch === " ") return 0.30;
+  return 0.55;
+}
+
+function estTextWidthEm(text) {
+  let total = 0;
+  for (const ch of String(text || "")) total += estCharWidthEm(ch);
+  return total;
+}
+
+// 폭 추정치와 실제 렌더러의 오차를 흡수하는 전역 안전 계수.
+const WIDTH_SAFETY_FACTOR = 0.92;
+
+/**
+ * 긴 텍스트를 "실제 폭(em)" 기준으로 여러 줄로 나눈다. 글자 수 기준 줄바꿈은
+ * 한글/영문 폭 차이로 카드 밖으로 넘치는 원인이라 폭 기준으로만 계산한다.
+ * 단어 단위로 나누되, 단어 하나가 한 줄 폭을 넘으면(공백 없는 긴 한글 구절 등)
+ * 문자 단위로 강제 절단하고, 다 못 들어가면 말줄임표를 붙인다.
+ */
+function wrapTextByWidth(text, maxWidthEm, maxLines) {
+  const words = String(text || "").split(/\s+/).filter(Boolean);
+  const lines = [];
+  let current = "";
+  let currentWidth = 0;
+  let truncated = false;
+
+  const pushLine = () => { if (current) lines.push(current); current = ""; currentWidth = 0; };
+
+  outer:
+  for (const word of words) {
+    if (lines.length >= maxLines) { truncated = true; break; }
+    const wordWidth = estTextWidthEm(word);
+    const sepWidth = current ? estCharWidthEm(" ") : 0;
+
+    if (currentWidth + sepWidth + wordWidth <= maxWidthEm) {
+      current = current ? `${current} ${word}` : word;
+      currentWidth += sepWidth + wordWidth;
+      continue;
+    }
+    if (current) {
+      pushLine();
+      if (lines.length >= maxLines) { truncated = true; break; }
+    }
+    if (wordWidth > maxWidthEm) {
+      let chunk = "";
+      let chunkWidth = 0;
+      for (const ch of word) {
+        const chW = estCharWidthEm(ch);
+        if (chunkWidth + chW > maxWidthEm && chunk) {
+          lines.push(chunk);
+          if (lines.length >= maxLines) { truncated = true; break outer; }
+          chunk = ch;
+          chunkWidth = chW;
+        } else {
+          chunk += ch;
+          chunkWidth += chW;
+        }
+      }
+      current = chunk;
+      currentWidth = chunkWidth;
+    } else {
+      current = word;
+      currentWidth = wordWidth;
+    }
+  }
+
+  if (lines.length < maxLines) {
+    if (current) lines.push(current);
+  } else if (current) {
+    truncated = true;
+  }
+  if (lines.length === 0) lines.push("");
+
+  const consumedLength = lines.join(" ").length;
+  if (truncated || String(text || "").length > consumedLength + words.length) {
+    let last = lines[lines.length - 1] || "";
+    const ellipsisWidth = estCharWidthEm("…");
+    while (last.length > 0 && estTextWidthEm(last) + ellipsisWidth > maxWidthEm) last = last.slice(0, -1);
+    lines[lines.length - 1] = last.replace(/[…\s]+$/, "") + "…";
+  }
+  return lines;
+}
+
+/**
+ * 줄바꿈 계산에 쓴 폭 가정과 실제 그리는 폰트 크기가 항상 일치하도록,
+ * 패널 폭 안에 들어오는 가장 큰 폰트 크기를 찾는다.
+ */
+function fitTitle(topic, panelInnerWidth, maxLines, maxFontSize, minFontSize) {
+  let fontSize = maxFontSize;
+  let lines = [];
+  const safeWidth = panelInnerWidth * WIDTH_SAFETY_FACTOR;
+  while (fontSize >= minFontSize) {
+    lines = wrapTextByWidth(topic, safeWidth / fontSize, maxLines);
+    if (lines.every((line) => estTextWidthEm(line) * fontSize <= safeWidth + 0.5)) break;
+    fontSize -= 4;
+  }
+  if (fontSize < minFontSize) fontSize = minFontSize;
+  return { fontSize, lines };
+}
+
+const FONT_STACK = "'Noto Sans CJK KR', 'Noto Sans KR', 'Malgun Gothic', '맑은 고딕', 'Apple SD Gothic Neo', 'Segoe UI', sans-serif";
+
+/* 카테고리별 심볼(24×24 그리드 기준 SVG path) — 주제의 "종류"만이라도
+   시각적으로 구분되게 카드 구석에 얹는다. */
+const CATEGORY_GLYPHS = {
+  messenger: "M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H10l-5 4v-4H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z",
+  device: "M6 3h9a2 2 0 0 1 2 2v13H4V5a2 2 0 0 1 2-2zM3 20h16M9 6h3",
+  finance: "M4 19V10M10 19V5M16 19v-7M2 19h20M4 10l6-5 6 4 4-4",
+  food: "M6 3v7a3 3 0 0 0 6 0V3M9 10v11M17 3c-2 2-2 5 0 8v10",
+  travel: "M2 16l7-2 4-9 2 1-3 8 6-1 2 2-8 4-2 5-2-1 1-5-7 2-1-2 3-2z",
+  health: "M12 21s-7-4.4-9.5-8.6C.6 8.8 2.4 5 6 5c2 0 3.4 1.1 4 2.3C10.6 6.1 12 5 14 5c3.6 0 5.4 3.8 3.5 7.4C19 16.6 12 21 12 21z",
+  education: "M2 8l10-4 10 4-10 4-10-4zM6 11v5c0 1.7 2.7 3 6 3s6-1.3 6-3v-5M22 8v6",
+  beauty: "M12 3c1.5 2 1.5 4 0 6 1.5 2 1.5 4 0 6M6 6c1.5 1.5 1.5 3.5 0 5M18 6c-1.5 1.5-1.5 3.5 0 5M4 15c2 3 5 5 8 6 3-1 6-3 8-6",
+  business: "M4 20V10l8-6 8 6v10M9 20v-6h6v6",
+  environment: "M12 2c4 3 7 7 7 11a7 7 0 0 1-14 0c0-4 3-8 7-11z",
+  entertainment: "M4 4l16 8-16 8V4z",
+  legal: "M12 3v18M6 7h12M4 7l3 6H1l3-6zM17 7l3 6h-6l3-6z",
+  home: "M3 11l9-7 9 7M5 10v10h14V10",
+  tech: "M4 4h16v12H4zM9 20h6M12 16v4M7 8h10M7 11h6",
+  default: "M12 2l2.9 6.9L22 10l-5.5 4.8L18 22l-6-3.6L6 22l1.5-7.2L2 10l7.1-1.1z",
+};
+
+const CATEGORY_KEYWORDS = [
+  // "라인"은 "온라인/오프라인"에 오탐되므로 메신저 문맥이 분명할 때만 매칭한다.
+  [/카카오톡|카톡|kakaotalk|네이버\s*라인|라인\s*(메신저|앱|친구)|line\s*app|왓츠앱|whatsapp|텔레그램|telegram|디스코드|discord|메신저|messenger|채팅/iu, "messenger"],
+  [/pc\s*버전|pc용|다운로드|download|설치|install|업데이트|update|갤럭시|galaxy|아이폰|iphone|아이패드|ipad|맥북|macbook|노트북|laptop|태블릿|모니터|스마트폰/iu, "device"],
+  [/재테크|투자|주식|펀드|자산|금융|은행|대출|부동산|아파트|주택|청약|세금|회계|계좌|적금|예금|연금/iu, "finance"],
+  [/요리|레시피|음식|맛집|카페|커피|베이커리/iu, "food"],
+  [/여행|관광|trip|해외여행|여행지|기차|열차|ktx|srt|항공권|비행기표|숙소|호텔|펜션|리조트|캠핑|글램핑/iu, "travel"],
+  [/건강|병원|치료|영양제|비타민|다이어트|운동|헬스|피트니스/iu, "health"],
+  [/교육|학습|공부|강의|수업|자격증|합격|취업준비/iu, "education"],
+  [/뷰티|화장품|스킨케어|패션/iu, "beauty"],
+  [/창업|스타트업|마케팅|비즈니스|취업|직장|커리어|채용|면접/iu, "business"],
+  [/환경|기후|생태|반려동물|강아지|고양이/iu, "environment"],
+  [/게임|gaming|e스포츠|영화|드라마|스트리밍|음악|아이돌/iu, "entertainment"],
+  [/법률|계약서|보험|소송|정책|지원금|복지|민원/iu, "legal"],
+  [/인테리어|이사|부동산\s*매물|가전/iu, "home"],
+  [/ai|인공지능|머신러닝|딥러닝|소프트웨어|프로그래밍|코딩|개발|it\b/iu, "tech"],
+];
+
+function detectCategory(text) {
+  for (const [pattern, category] of CATEGORY_KEYWORDS) {
+    if (pattern.test(String(text || ""))) return category;
+  }
+  return "default";
+}
+
+/* ── SVG 디자인 카드 렌더러 (v3.1) ───────────────────
+   두 가지 변형을 하나로 제공한다:
+   ① 문구 포함(title 전달 시) — 사용자가 「디자인 카드」를 직접 고른 경우.
+      사용자가 입력한 문구(엔터 줄바꿈 존중)를 카드의 디자인 타이포 자리에
+      직접 렌더링하고, 플러그인은 캔버스 문구 합성을 건너뛴다.
+   ② 문구 없음(title 생략) — AI 그림 실패 시 폴백 배경. 문구는 플러그인의
+      캔버스 합성 단계가 얹으므로 글자를 넣지 않는다(이중 텍스트 방지).
+   topic은 카테고리 심볼 선택과 타이포 스타일의 배경 텍스처에 쓰인다.
+   AI 호출 없음(뉴런 0). 좌표계는 1024×1024 고정(viewBox slice). */
+export function fallbackSvg(topic, width = 1024, height = 1024, style = "poster", title = "", subtitle = "") {
+  const s = String(topic || "thumbnail").trim();
+  const dTitle = String(title || "").trim();
+  const withText = dTitle !== "";
+  const sub0 = String(subtitle || "").trim();
+  const sub = withText && sub0 && sub0 !== dTitle ? sub0.slice(0, 80) : "";
+  const glyph = CATEGORY_GLYPHS[detectCategory(s)] || CATEGORY_GLYPHS.default;
+  const esc = escapeXml;
+
+  const glyphAt = (x, y, svgPx, color, sw, opacity) =>
+    `<g transform="translate(${x}, ${y}) scale(${(svgPx / 24).toFixed(3)})"${opacity != null ? ` opacity="${opacity}"` : ""}>` +
+    `<path d="${glyph}" fill="none" stroke="${color}" stroke-width="${sw}" stroke-linejoin="round" stroke-linecap="round"/></g>`;
+
+  // 사용자의 수동 줄바꿈(엔터)을 존중하면서 각 줄을 폭에 맞춰 자동 줄바꿈.
+  const wrapManual = (text, availW, maxLines, fontSize) => {
+    const maxWEm = (availW * WIDTH_SAFETY_FACTOR) / fontSize;
+    let lines = [];
+    for (const seg of String(text).split(/\n/).map((t) => t.trim()).filter(Boolean)) {
+      if (lines.length >= maxLines) break;
+      lines = lines.concat(wrapTextByWidth(seg, maxWEm, maxLines - lines.length));
+    }
+    return lines.slice(0, maxLines);
+  };
+  const len = [...dTitle.replace(/\n/g, "")].length || 1;
+  const scale = len <= 14 ? 1.0 : ( len <= 24 ? 0.8 : 0.62 );
+  const titleBlock = (availW, maxLines, maxFont, minFont) => {
+    let fontSize = Math.max(minFont, Math.round(maxFont * scale));
+    let lines = wrapManual(dTitle, availW, maxLines, fontSize);
+    while (fontSize > minFont) {
+      lines = wrapManual(dTitle, availW, maxLines, fontSize);
+      const fitsW = lines.every((ln) => estTextWidthEm(ln) * fontSize <= availW * WIDTH_SAFETY_FACTOR + 0.5);
+      if (fitsW) break;
+      fontSize -= 4;
+    }
+    const lh = fontSize * 1.18;
+    return { fontSize, lines, lh, blockH: (lines.length - 1) * lh + fontSize };
+  };
+  const tspans = (lines, x, lh) =>
+    lines.map((ln, i) => `<tspan x="${x}" dy="${i === 0 ? 0 : lh.toFixed(1)}">${esc(ln)}</tspan>`).join("");
+  const subLines = (availW, fontSize) => sub ? wrapTextByWidth(sub, (availW * WIDTH_SAFETY_FACTOR) / fontSize, 2) : [];
+
+  let defs = "";
+  let body = "";
+
+  if (style === "minimal") {
+    defs = `<pattern id="dg" width="30" height="30" patternUnits="userSpaceOnUse"><circle cx="4" cy="4" r="3" fill="rgba(37,99,235,0.30)"/></pattern>`;
+    body = `<rect width="1024" height="1024" fill="#f7f8fb"/>
+<rect x="44" y="44" width="936" height="936" fill="none" stroke="#d7dce6" stroke-width="2"/>
+<path d="M44 76V44h32M948 44h32v32M44 948v32h32M980 948v32h-32" fill="none" stroke="#2563eb" stroke-width="6"/>
+<circle cx="786" cy="212" r="95" fill="#e3ebfd"/><circle cx="755" cy="274" r="44" fill="#2563eb" opacity="0.9"/>
+<rect x="651" y="726" width="260" height="190" fill="url(#dg)"/>`;
+    if (withText) {
+      const t = titleBlock(700, 3, 88, 34);
+      const topY = 512 - t.blockH / 2;
+      body += `
+<rect x="113" y="${(topY - 112).toFixed(0)}" width="74" height="74" rx="20" fill="#e8eefc"/>
+${glyphAt(129, topY - 96, 42, "#2563eb", 1.7)}
+<line x1="205" y1="${(topY - 75).toFixed(0)}" x2="790" y2="${(topY - 75).toFixed(0)}" stroke="#d7dce6" stroke-width="2"/>
+<text x="113" y="${(topY + t.fontSize).toFixed(0)}" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-2" fill="#111827">${tspans(t.lines, 113, t.lh)}</text>
+<rect x="113" y="${(topY + t.blockH + 44).toFixed(0)}" width="170" height="10" fill="#2563eb"/>`;
+    } else {
+      body += `
+<rect x="113" y="180" width="74" height="74" rx="20" fill="#e8eefc"/>
+${glyphAt(129, 196, 42, "#2563eb", 1.7)}
+<line x1="205" y1="217" x2="640" y2="217" stroke="#d7dce6" stroke-width="2"/>
+<rect x="113" y="770" width="170" height="10" fill="#2563eb"/>`;
+    }
+  } else if (style === "typography") {
+    const ghostSrc = (withText ? dTitle.replace(/\n/g, " ") : s);
+    const gRows = [110, 314, 518, 722, 926].map((y, i) =>
+      `<text x="${i % 2 ? 1016 : 8}" y="${y}" text-anchor="${i % 2 ? "end" : "start"}" font-family="${FONT_STACK}" font-size="118" font-weight="800" letter-spacing="-2" fill="none" stroke="${i % 2 ? "rgba(148,163,184,0.13)" : "rgba(251,146,60,0.16)"}" stroke-width="2">${esc(ghostSrc)}</text>`
+    ).join("");
+    body = `<rect width="1024" height="1024" fill="#101623"/>${gRows}`;
+    if (withText) {
+      const t = titleBlock(840, 3, 118, 40);
+      const topY = 512 - t.blockH / 2;
+      body += `
+<rect x="92" y="${(topY - 54).toFixed(0)}" width="120" height="12" rx="6" fill="#fb923c"/>
+<text x="92" y="${(topY + t.fontSize).toFixed(0)}" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-3" fill="#f8fafc">${tspans(t.lines, 92, t.lh)}</text>
+<line x1="92" y1="${(topY + t.blockH + 46).toFixed(0)}" x2="312" y2="${(topY + t.blockH + 46).toFixed(0)}" stroke="rgba(248,250,252,0.35)" stroke-width="4"/>
+<circle cx="326" cy="${(topY + t.blockH + 46).toFixed(0)}" r="7" fill="#fb923c"/>`;
+    } else {
+      body += `
+<rect x="92" y="238" width="120" height="12" rx="6" fill="#fb923c"/>
+<line x1="92" y1="780" x2="312" y2="780" stroke="rgba(248,250,252,0.35)" stroke-width="4"/>
+<circle cx="326" cy="780" r="7" fill="#fb923c"/>`;
+    }
+  } else if (style === "branding") {
+    defs = `<radialGradient id="bgr" cx="50%" cy="30%" r="80%"><stop offset="0%" stop-color="#2a1035"/><stop offset="55%" stop-color="#120a1d"/><stop offset="100%" stop-color="#090e18"/></radialGradient>
+<linearGradient id="gbar" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f43f5e"/><stop offset="1" stop-color="#a855f7"/></linearGradient>
+<linearGradient id="badge" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="rgba(244,63,94,0.25)"/><stop offset="1" stop-color="rgba(168,85,247,0.25)"/></linearGradient>
+<filter id="glow" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="34"/></filter>`;
+    body = `<rect width="1024" height="1024" fill="url(#bgr)"/>
+<circle cx="60" cy="60" r="137" fill="none" stroke="rgba(244,63,94,0.28)" stroke-width="26"/>
+<circle cx="964" cy="964" r="120" fill="none" stroke="rgba(168,85,247,0.30)" stroke-width="20"/>
+<circle cx="164" cy="798" r="7" fill="#f43f5e"/><circle cx="840" cy="246" r="5" fill="#a855f7"/>
+<circle cx="758" cy="870" r="4" fill="rgba(255,255,255,0.6)"/><circle cx="246" cy="174" r="4" fill="rgba(255,255,255,0.45)"/>`;
+    if (withText) {
+      const t = titleBlock(800, 3, 92, 36);
+      const sf = 28;
+      const sl = subLines(800, sf);
+      const subH = sl.length ? 30 + (sl.length - 1) * sf * 1.5 + sf : 0;
+      const total = 128 + 52 + t.blockH + subH + 48 + 12;
+      let y = 512 - total / 2;
+      const badgeCy = y + 64;
+      y += 128 + 52;
+      const titleY = y + t.fontSize;
+      y += t.blockH;
+      const subY = y + 30 + sf;
+      y += subH + 48;
+      body += `
+<circle cx="512" cy="${badgeCy.toFixed(0)}" r="80" fill="rgba(244,63,94,0.35)" filter="url(#glow)"/>
+<circle cx="512" cy="${badgeCy.toFixed(0)}" r="64" fill="url(#badge)" stroke="rgba(255,255,255,0.25)" stroke-width="2"/>
+${glyphAt(480, badgeCy - 32, 64, "#ffffff", 1.6)}
+<text x="512" y="${titleY.toFixed(0)}" text-anchor="middle" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-2.5" fill="#ffffff">${tspans(t.lines, 512, t.lh)}</text>
+${sl.length ? `<text x="512" y="${subY.toFixed(0)}" text-anchor="middle" font-family="${FONT_STACK}" font-size="${sf}" fill="rgba(255,255,255,0.8)">${sl.map((ln, i) => `<tspan x="512" dy="${i === 0 ? 0 : sf * 1.5}">${esc(ln)}</tspan>`).join("")}</text>` : ""}
+<rect x="397" y="${y.toFixed(0)}" width="230" height="12" rx="6" fill="url(#gbar)"/>`;
+    } else {
+      body += `
+<circle cx="512" cy="190" r="80" fill="rgba(244,63,94,0.35)" filter="url(#glow)"/>
+<circle cx="512" cy="190" r="64" fill="url(#badge)" stroke="rgba(255,255,255,0.25)" stroke-width="2"/>
+${glyphAt(480, 158, 64, "#ffffff", 1.6)}
+<rect x="397" y="800" width="230" height="12" rx="6" fill="url(#gbar)"/>`;
+    }
+  } else if (style === "photo_realistic") {
+    defs = `<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0e2233"/><stop offset="45%" stop-color="#14424b"/><stop offset="72%" stop-color="#3c6d55"/><stop offset="100%" stop-color="#c2803f"/></linearGradient>
+<filter id="sunglow" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="30"/></filter>`;
+    const poly = (hPct, pts) => {
+      const top = 1024 - 1024 * hPct;
+      return pts.map(([px, py]) => `${(px * 10.24).toFixed(1)},${(top + py * 10.24 * hPct).toFixed(1)}`).join(" ");
+    };
+    const m1 = poly(0.52, [[0,100],[0,62],[16,38],[30,58],[46,26],[60,52],[74,34],[88,56],[100,44],[100,100]]);
+    const m2 = poly(0.40, [[0,100],[0,70],[12,52],[26,68],[40,44],[58,72],[72,52],[86,70],[100,58],[100,100]]);
+    body = `<rect width="1024" height="1024" fill="url(#sky)"/>
+<circle cx="760" cy="220" r="120" fill="rgba(252,211,77,0.45)" filter="url(#sunglow)"/>
+<circle cx="760" cy="220" r="85" fill="#fcd34d"/>
+<polygon points="${m1}" fill="#1d3a30"/><polygon points="${m2}" fill="#122620"/>`;
+    if (withText) {
+      const t = titleBlock(700, 2, 56, 28);
+      const sf = 25;
+      const sl = subLines(700, sf);
+      const contentH = t.blockH + (sl.length ? 14 + (sl.length - 1) * sf * 1.45 + sf : 0);
+      const capH = Math.max(104, contentH) + 84;
+      const capY = 1024 - 61 - capH;
+      const titleY = capY + 42 + (Math.max(104, contentH) - contentH) / 2 + t.fontSize;
+      const subY = capY + 42 + (Math.max(104, contentH) - contentH) / 2 + t.blockH + 14 + sf;
+      body += `
+<rect x="61" y="${capY.toFixed(0)}" width="902" height="${capH.toFixed(0)}" rx="26" fill="rgba(8,16,14,0.55)" stroke="rgba(255,255,255,0.12)"/>
+<text x="107" y="${titleY.toFixed(0)}" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-1.5" fill="#f0fdf4">${tspans(t.lines, 107, t.lh)}</text>
+${sl.length ? `<text x="107" y="${subY.toFixed(0)}" font-family="${FONT_STACK}" font-size="${sf}" fill="rgba(240,253,244,0.8)">${sl.map((ln, i) => `<tspan x="107" dy="${i === 0 ? 0 : sf * 1.45}">${esc(ln)}</tspan>`).join("")}</text>` : ""}
+<rect x="817" y="${(capY + (capH - 104) / 2).toFixed(0)}" width="104" height="104" rx="24" fill="rgba(255,255,255,0.12)"/>
+${glyphAt(841, capY + (capH - 104) / 2 + 24, 56, "#f0fdf4", 1.6)}`;
+    } else {
+      body += `
+<rect x="858" y="856" width="104" height="104" rx="24" fill="rgba(255,255,255,0.12)"/>
+${glyphAt(882, 880, 56, "#f0fdf4", 1.6)}`;
+    }
+  } else { // poster (기본)
+    defs = `<linearGradient id="pbg" x1="0" y1="0" x2="1" y2="0.6"><stop offset="0%" stop-color="#0b1226"/><stop offset="55%" stop-color="#132a54"/><stop offset="100%" stop-color="#1e3a8a"/></linearGradient>
+<linearGradient id="rib" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f97316"/><stop offset="1" stop-color="#fb5f2a"/></linearGradient>
+<pattern id="pd" width="34" height="34" patternUnits="userSpaceOnUse"><circle cx="4" cy="4" r="3" fill="rgba(148,197,255,0.45)"/></pattern>`;
+    body = `<rect width="1024" height="1024" fill="url(#pbg)"/>
+<rect x="655" y="72" width="300" height="220" fill="url(#pd)"/>
+${glyphAt(590, 164, 560, "#93c5fd", 1.1, 0.14)}
+<g transform="rotate(-7 512 512)"><rect x="-100" y="742" width="1224" height="118" fill="url(#rib)" opacity="0.92"/><rect x="-100" y="906" width="1224" height="26" fill="#38bdf8" opacity="0.75"/></g>`;
+    if (withText) {
+      const t = titleBlock(740, 3, 104, 40);
+      const titleY = 246 + 12 + 40 + t.fontSize;
+      const sf = 29;
+      const sl = subLines(740, sf);
+      const subY = 246 + 12 + 40 + t.blockH + 26 + sf;
+      body += `
+<rect x="82" y="246" width="120" height="12" rx="6" fill="#38bdf8"/>
+<text x="82" y="${titleY.toFixed(0)}" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-2.5" fill="#f8fafc">${tspans(t.lines, 82, t.lh)}</text>
+${sl.length ? `<text x="82" y="${subY.toFixed(0)}" font-family="${FONT_STACK}" font-size="${sf}" fill="rgba(248,250,252,0.85)">${sl.map((ln, i) => `<tspan x="82" dy="${i === 0 ? 0 : sf * 1.5}">${esc(ln)}</tspan>`).join("")}</text>` : ""}`;
+    } else {
+      body += `
+<rect x="82" y="216" width="120" height="12" rx="6" fill="#38bdf8"/>`;
+    }
+    body += `
+<rect x="82" y="866" width="92" height="92" rx="24" fill="rgba(255,255,255,0.12)" stroke="rgba(255,255,255,0.18)"/>
+${glyphAt(102, 886, 52, "#f8fafc", 1.6)}`;
+  }
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 1024 1024" preserveAspectRatio="xMidYMid slice">
+<defs>${defs}</defs>
+${body}
+</svg>`;
+  const b64 = bytesToBase64(new TextEncoder().encode(svg));
+  return { b64, mime: "image/svg+xml" };
+}
 async function handleImage(request, env) {
   let body = {};
   try {
@@ -356,16 +967,24 @@ async function handleImage(request, env) {
   const prompt = String(body.prompt || body.topic || "").replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 1200);
   const topic = String(body.topic || body.prompt || "").trim().slice(0, 120);
   if (!prompt) return json({ error: "prompt 또는 topic이 필요합니다." }, 400);
+  const style = STYLE_MODEL_CHAIN[String(body.style || "").trim()] ? String(body.style).trim() : "poster";
   const w = Math.max(512, Math.min(1536, parseInt(body.width, 10) || 1024));
   const h = Math.max(512, Math.min(1536, parseInt(body.height, 10) || 1024));
+  // card_only: AI를 건너뛰고 곧장 SVG 디자인 카드만 만든다 (뉴런 0 —
+  // 사용자가 "디자인 카드" 타입을 직접 고른 경우).
+  const cardOnly = Boolean(body.card_only);
 
-  if (env && env.AI && typeof env.AI.run === "function") {
-    for (const model of IMAGE_MODELS) {
-      const hit = await tryModel(env, model, prompt, w, h);
+  if (!cardOnly && env && env.AI && typeof env.AI.run === "function") {
+    for (const modelId of STYLE_MODEL_CHAIN[style]) {
+      const hit = await tryModel(env, modelId, buildModelInput(modelId, prompt, style, w, h));
       if (hit) {
         return json({
           success: true,
-          provider: model.id,
+          // 플러그인은 provider가 "workers-ai-flux"일 때만 "AI 그림"으로 표시하므로
+          // (폴백과의 구분용 고정 문자열), 실제 모델 id는 model 필드로 따로 준다.
+          provider: "workers-ai-flux",
+          model: modelId,
+          style,
           format: hit.mime.split("/")[1],
           mime_type: hit.mime,
           image_base64: hit.b64,
@@ -375,15 +994,18 @@ async function handleImage(request, env) {
     }
   }
 
-  const svg = fallbackSvg(topic || prompt, w, h);
+  const svg = fallbackSvg(topic || prompt, w, h, style,
+    cardOnly ? String(body.title || "").slice(0, 120) : "",
+    cardOnly ? String(body.subtitle || "").slice(0, 90) : "");
   return json({
     success: true,
-    provider: "svg-fallback",
+    provider: cardOnly ? "design-card" : "svg-fallback",
+    style,
     format: "svg",
     mime_type: svg.mime,
     image_base64: svg.b64,
     data_url: `data:${svg.mime};base64,${svg.b64}`,
-    note: "Workers AI 바인딩이 없거나 이미지 모델 호출이 실패해 SVG 카드로 대체했습니다.",
+    note: cardOnly ? "요청에 따라 SVG 디자인 카드를 생성했습니다." : "Workers AI 바인딩이 없거나 이미지 모델 호출이 실패해 SVG 카드로 대체했습니다.",
   });
 }
 
@@ -394,35 +1016,56 @@ const DOCS_HTML = `<!doctype html><html lang="ko"><head><meta charset="utf-8"><m
 <body><main><h1>tamsaek-worker 검색·이미지 API</h1>
 <p>탐색팩 플러그인용 검색 그라운딩 + AI 이미지 생성 워커입니다. 워드프레스 관리자 → AI 글쓰기 설정의 "검색 Worker 주소"에 이 주소를 넣으세요.</p>
 <pre>GET  /api/search?q=검색어&amp;engine=all   (naver·daum·bing·google 병렬)
+POST /api/research  {"query":"주제"}   (썸네일용 주제 조사 JSON)
 POST /api/image  {"prompt":"...","width":1024,"height":1024}</pre>
 <p>engine 값: <code>all</code> <code>naver</code> <code>daum</code> <code>bing</code> <code>google</code> (쉼표로 조합 가능)</p>
 <p>Google은 자동화 차단 때문에 뉴스 RSS 기반이라 결과가 뉴스 기사로 한정됩니다. 이미지 생성은 Cloudflare Workers AI 바인딩이 켜져 있어야 실제 AI 이미지가 나오고, 없으면 SVG 카드로 대체됩니다.</p>
 </main></body></html>`;
 
+async function routeRequest(request, env) {
+  const url = new URL(request.url);
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+
+  if (url.pathname.indexOf("/api/") === 0) {
+    // 비밀키가 등록된 경우에만 검사한다 (미등록 시 개방).
+    const secret = env && env.WORKER_SECRET ? String(env.WORKER_SECRET) : "";
+    if (secret && request.headers.get("X-AIBP-Secret") !== secret) {
+      return json({ error: "인증 실패: X-AIBP-Secret 헤더가 필요합니다." }, 401);
+    }
+  }
+
+  if (url.pathname === "/api/search") {
+    if (request.method !== "GET") return json({ error: "Method Not Allowed" }, 405);
+    return handleSearch(request);
+  }
+  if (url.pathname === "/api/research") {
+    if (request.method !== "POST") return json({ error: "Method Not Allowed" }, 405);
+    return handleResearch(request, env);
+  }
+  if (url.pathname === "/api/image") {
+    if (request.method !== "GET" && request.method !== "POST") return json({ error: "Method Not Allowed" }, 405);
+    return handleImage(request, env);
+  }
+  if (url.pathname === "/" && request.method === "GET") {
+    return new Response(DOCS_HTML, { headers: { "Content-Type": "text/html; charset=utf-8", ...CORS } });
+  }
+  return json({ error: "Not Found", endpoints: ["/api/search?q=...&engine=all", "/api/research", "/api/image"] }, 404);
+}
+
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-
-    if (url.pathname.indexOf("/api/") === 0) {
-      // 비밀키가 등록된 경우에만 검사한다 (미등록 시 개방).
-      const secret = env && env.WORKER_SECRET ? String(env.WORKER_SECRET) : "";
-      if (secret && request.headers.get("X-AIBP-Secret") !== secret) {
-        return json({ error: "인증 실패: X-AIBP-Secret 헤더가 필요합니다." }, 401);
-      }
+    /* ⚠️ 안정성: 어떤 경로에서 예외가 나든 항상 JSON을 반환한다. 전역
+       try/catch가 없으면 Cloudflare가 "1101 Worker threw an exception"
+       HTML 오류 페이지를 반환하고, 플러그인은 JSON을 기대하므로 관리
+       화면에 아무 메시지 없이 실패하게 된다. */
+    try {
+      return await routeRequest(request, env);
+    } catch (error) {
+      return json({
+        success: false,
+        error: "internal_worker_error",
+        message: String((error && error.message) || error),
+      }, 500);
     }
-
-    if (url.pathname === "/api/search") {
-      if (request.method !== "GET") return json({ error: "Method Not Allowed" }, 405);
-      return handleSearch(request);
-    }
-    if (url.pathname === "/api/image") {
-      if (request.method !== "GET" && request.method !== "POST") return json({ error: "Method Not Allowed" }, 405);
-      return handleImage(request, env);
-    }
-    if (url.pathname === "/" && request.method === "GET") {
-      return new Response(DOCS_HTML, { headers: { "Content-Type": "text/html; charset=utf-8", ...CORS } });
-    }
-    return json({ error: "Not Found", endpoints: ["/api/search?q=...&engine=all", "/api/image"] }, 404);
   },
 };

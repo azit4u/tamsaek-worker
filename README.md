@@ -51,7 +51,7 @@ AI 썸네일 배경 생성을 쓰려면 필요합니다. (검색만 쓸 거면 �
 2. **Add** → **Workers AI** 선택 → Variable name을 `AI` 로 입력 → 저장/Deploy
 
 확인: 브라우저에서 `https://내워커주소/api/image?prompt=test` 를 열었을 때
-- `"provider":"@cf/black-forest-labs/flux-1-schnell"` 이 보이면 성공
+- `"provider":"workers-ai-flux"` 가 보이면 성공 (`"model"` 필드에 실제 응답한 모델 id가 표시됨)
 - `"provider":"svg-fallback"` 이면 바인딩이 아직 안 붙은 것 → 위 과정 다시 확인
 
 ## 3단계. 비밀키 걸기 (남이 내 워커 못 쓰게 — 강력 추천)
@@ -101,8 +101,13 @@ AI 썸네일 배경 생성을 쓰려면 필요합니다. (검색만 쓸 거면 �
 
 - `GET /api/search?q=검색어&engine=all` — engine: `all` `naver` `daum` `bing` `google` (쉼표 조합 가능)
   - 응답: `{ providers: [ { engine, label, results: [{title, url, snippet}] } ] }`
-- `GET|POST /api/image` — body `{"prompt":"...","width":1024,"height":1024}` → `{ data_url, provider }`
-  - 모델 체인: flux-1-schnell → SDXL-Lightning → DreamShaper → SVG 카드 폴백
+- `POST /api/research` — body `{"query":"주제"}` → `{ summary, results, research: { actual_meaning, visual_context, hero_shot, color_mood, key_visuals, category, emotional_tone, ... } }`
+  - 썸네일 프롬프트용 주제 조사: 검색(네이버·다음·Bing 병렬) 후 규칙 기반 분석. Workers AI 바인딩이 있으면 소형 텍스트 모델 1회 호출로 정성 필드만 보강(실패 시 규칙 기반 결과 유지)
+- `GET|POST /api/image` — body `{"prompt":"...","style":"poster","width":1024,"height":1024}` → `{ data_url, provider, model }`
+  - style: `poster` `minimal` `typography` `branding` `photo_realistic` (그 외/생략 시 poster)
+  - 스타일별 모델 체인(1순위는 항상 저스텝·저비용 모델): 예) poster는 SDXL-Lightning → flux-1-schnell → DreamShaper → SDXL-base, photo_realistic은 DreamShaper 1순위. 체인 전체 실패 시 스타일별 SVG 카드 폴백(항상 성공)
+  - 예외 발생 시에도 항상 JSON 반환(전역 try/catch) — HTML 오류 페이지가 나가지 않음
+  - `card_only: true`를 보내면 AI를 건너뛰고 곧장 SVG 디자인 카드만 생성(뉴런 0). `subtitle`을 함께 보내면 카드에 부제로 표시. 폴백 카드와 동일한 스타일별 v3 도안(포스터 리본/미니멀 액자/타이포 반복/브랜딩 배지/풍경 캡션)
 - 비밀키: `WORKER_SECRET` 등록 시 모든 `/api/*` 요청에 `X-AIBP-Secret` 헤더 검사
 - 터미널 배포: `npx wrangler login` 후 `npx wrangler deploy`, 비밀키는 `npx wrangler secret put WORKER_SECRET`
 - `worker.js`는 Node에서도 그대로 import 가능 — 저장한 검색 페이지 HTML로 파서(`parseNaver` 등)만 단독 시험 가능
