@@ -764,9 +764,13 @@ function detectCategory(text) {
       캔버스 합성 단계가 얹으므로 글자를 넣지 않는다(이중 텍스트 방지).
    topic은 카테고리 심볼 선택과 타이포 스타일의 배경 텍스처에 쓰인다.
    AI 호출 없음(뉴런 0). 좌표계는 1024×1024 고정(viewBox slice). */
-export function fallbackSvg(topic, width = 1024, height = 1024, style = "poster", title = "", subtitle = "") {
+export function fallbackSvg(topic, width = 1024, height = 1024, style = "poster", title = "", subtitle = "", titleSize = 0, subSize = 0) {
   const s = String(topic || "thumbnail").trim();
   const dTitle = String(title || "").trim();
+  // 사용자가 크기를 직접 지정하면 자동 크기 대신 그 값을 쓴다
+  // (폭은 줄바꿈이 보장, 줄 수는 3줄 제한 유지).
+  const fixedTitlePx = Math.max(0, Math.min(400, parseInt(titleSize, 10) || 0));
+  const fixedSubPx = Math.max(0, Math.min(300, parseInt(subSize, 10) || 0));
   const withText = dTitle !== "";
   const sub0 = String(subtitle || "").trim();
   const sub = withText && sub0 && sub0 !== dTitle ? sub0.slice(0, 80) : "";
@@ -790,6 +794,12 @@ export function fallbackSvg(topic, width = 1024, height = 1024, style = "poster"
   const len = [...dTitle.replace(/\n/g, "")].length || 1;
   const scale = len <= 14 ? 1.0 : ( len <= 24 ? 0.8 : 0.62 );
   const titleBlock = (availW, maxLines, maxFont, minFont) => {
+    if (fixedTitlePx > 0) {
+      const fontSize = fixedTitlePx;
+      const lines = wrapManual(dTitle, availW, maxLines, fontSize);
+      const lh = fontSize * 1.18;
+      return { fontSize, lines, lh, blockH: (lines.length - 1) * lh + fontSize };
+    }
     let fontSize = Math.max(minFont, Math.round(maxFont * scale));
     let lines = wrapManual(dTitle, availW, maxLines, fontSize);
     while (fontSize > minFont) {
@@ -863,7 +873,7 @@ ${glyphAt(129, 196, 42, "#2563eb", 1.7)}
 <circle cx="758" cy="870" r="4" fill="rgba(255,255,255,0.6)"/><circle cx="246" cy="174" r="4" fill="rgba(255,255,255,0.45)"/>`;
     if (withText) {
       const t = titleBlock(800, 3, 92, 36);
-      const sf = 28;
+      const sf = fixedSubPx > 0 ? fixedSubPx : 28;
       const sl = subLines(800, sf);
       const subH = sl.length ? 30 + (sl.length - 1) * sf * 1.5 + sf : 0;
       const total = 128 + 52 + t.blockH + subH + 48 + 12;
@@ -903,7 +913,7 @@ ${glyphAt(480, 158, 64, "#ffffff", 1.6)}
 <polygon points="${m1}" fill="#1d3a30"/><polygon points="${m2}" fill="#122620"/>`;
     if (withText) {
       const t = titleBlock(700, 2, 56, 28);
-      const sf = 25;
+      const sf = fixedSubPx > 0 ? fixedSubPx : 25;
       const sl = subLines(700, sf);
       const contentH = t.blockH + (sl.length ? 14 + (sl.length - 1) * sf * 1.45 + sf : 0);
       const capH = Math.max(104, contentH) + 84;
@@ -932,7 +942,7 @@ ${glyphAt(590, 164, 560, "#93c5fd", 1.1, 0.14)}
     if (withText) {
       const t = titleBlock(740, 3, 104, 40);
       const titleY = 246 + 12 + 40 + t.fontSize;
-      const sf = 29;
+      const sf = fixedSubPx > 0 ? fixedSubPx : 29;
       const sl = subLines(740, sf);
       const subY = 246 + 12 + 40 + t.blockH + 26 + sf;
       body += `
@@ -996,7 +1006,9 @@ async function handleImage(request, env) {
 
   const svg = fallbackSvg(topic || prompt, w, h, style,
     cardOnly ? String(body.title || "").slice(0, 120) : "",
-    cardOnly ? String(body.subtitle || "").slice(0, 90) : "");
+    cardOnly ? String(body.subtitle || "").slice(0, 90) : "",
+    cardOnly ? body.title_size : 0,
+    cardOnly ? body.sub_size : 0);
   return json({
     success: true,
     provider: cardOnly ? "design-card" : "svg-fallback",
