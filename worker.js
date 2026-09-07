@@ -755,33 +755,29 @@ function detectCategory(text) {
   return "default";
 }
 
-/* ── SVG 디자인 카드 렌더러 (v3.1) ───────────────────
-   두 가지 변형을 하나로 제공한다:
-   ① 문구 포함(title 전달 시) — 사용자가 「디자인 카드」를 직접 고른 경우.
-      사용자가 입력한 문구(엔터 줄바꿈 존중)를 카드의 디자인 타이포 자리에
-      직접 렌더링하고, 플러그인은 캔버스 문구 합성을 건너뛴다.
-   ② 문구 없음(title 생략) — AI 그림 실패 시 폴백 배경. 문구는 플러그인의
-      캔버스 합성 단계가 얹으므로 글자를 넣지 않는다(이중 텍스트 방지).
-   topic은 카테고리 심볼 선택과 타이포 스타일의 배경 텍스처에 쓰인다.
-   AI 호출 없음(뉴런 0). 좌표계는 1024×1024 고정(viewBox slice). */
+/* ── SVG 디자인 카드 렌더러 (v4 — 변주 시스템) ─────────
+   두 가지 변형: ① 문구 포함(title 전달 — 카드 모드, 캔버스 합성 생략)
+   ② 문구 없음(AI 실패 폴백 — 캔버스가 문구를 얹음, 중앙 비움).
+   [v4] "매번 똑같은 카드" 문제 해결: 스타일마다 배색 팔레트 3~4종과
+   장식 배치 변형을 두고 생성할 때마다 무작위 조합 — AI 그림처럼
+   「다시 생성」할 때마다 다른 카드가 나온다. 사실적 사진 스타일은
+   풍경 자체가 3종(석양 산맥/밤하늘/바다 수평선). AI 호출 없음(뉴런 0). */
 export function fallbackSvg(topic, width = 1024, height = 1024, style = "poster", title = "", subtitle = "", titleSize = 0, subSize = 0) {
   const s = String(topic || "thumbnail").trim();
   const dTitle = String(title || "").trim();
-  // 사용자가 크기를 직접 지정하면 자동 크기 대신 그 값을 쓴다
-  // (폭은 줄바꿈이 보장, 줄 수는 3줄 제한 유지).
-  const fixedTitlePx = Math.max(0, Math.min(400, parseInt(titleSize, 10) || 0));
-  const fixedSubPx = Math.max(0, Math.min(300, parseInt(subSize, 10) || 0));
   const withText = dTitle !== "";
   const sub0 = String(subtitle || "").trim();
   const sub = withText && sub0 && sub0 !== dTitle ? sub0.slice(0, 80) : "";
+  const fixedTitlePx = Math.max(0, Math.min(400, parseInt(titleSize, 10) || 0));
+  const fixedSubPx = Math.max(0, Math.min(300, parseInt(subSize, 10) || 0));
   const glyph = CATEGORY_GLYPHS[detectCategory(s)] || CATEGORY_GLYPHS.default;
   const esc = escapeXml;
+  const R = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
   const glyphAt = (x, y, svgPx, color, sw, opacity) =>
     `<g transform="translate(${x}, ${y}) scale(${(svgPx / 24).toFixed(3)})"${opacity != null ? ` opacity="${opacity}"` : ""}>` +
     `<path d="${glyph}" fill="none" stroke="${color}" stroke-width="${sw}" stroke-linejoin="round" stroke-linecap="round"/></g>`;
 
-  // 사용자의 수동 줄바꿈(엔터)을 존중하면서 각 줄을 폭에 맞춰 자동 줄바꿈.
   const wrapManual = (text, availW, maxLines, fontSize) => {
     const maxWEm = (availW * WIDTH_SAFETY_FACTOR) / fontSize;
     let lines = [];
@@ -819,57 +815,94 @@ export function fallbackSvg(topic, width = 1024, height = 1024, style = "poster"
   let body = "";
 
   if (style === "minimal") {
-    defs = `<pattern id="dg" width="30" height="30" patternUnits="userSpaceOnUse"><circle cx="4" cy="4" r="3" fill="rgba(37,99,235,0.30)"/></pattern>`;
-    body = `<rect width="1024" height="1024" fill="#f7f8fb"/>
-<rect x="44" y="44" width="936" height="936" fill="none" stroke="#d7dce6" stroke-width="2"/>
-<path d="M44 76V44h32M948 44h32v32M44 948v32h32M980 948v32h-32" fill="none" stroke="#2563eb" stroke-width="6"/>
-<circle cx="786" cy="212" r="95" fill="#e3ebfd"/><circle cx="755" cy="274" r="44" fill="#2563eb" opacity="0.9"/>
-<rect x="651" y="726" width="260" height="190" fill="url(#dg)"/>`;
+    // 팔레트 변주: 강조색·잉크색·장식 톤
+    const P = R([
+      { bg: "#f7f8fb", ink: "#111827", accent: "#2563eb", soft: "#e3ebfd", dot: "rgba(37,99,235,0.30)", line: "#d7dce6" },
+      { bg: "#faf7f2", ink: "#1c1917", accent: "#ea580c", soft: "#fde8d7", dot: "rgba(234,88,12,0.30)", line: "#e2ddd4" },
+      { bg: "#f4f9f6", ink: "#0f2e21", accent: "#0d9488", soft: "#d5efe7", dot: "rgba(13,148,136,0.30)", line: "#d3e3db" },
+      { bg: "#f8f7fb", ink: "#1e1b2e", accent: "#7c3aed", soft: "#e9e2fb", dot: "rgba(124,58,237,0.28)", line: "#ddd8e8" },
+    ]);
+    // 장식 변형: 원 2개 / 사분원 아치 / 겹친 사각 프레임
+    const decoKind = R(["circles", "arc", "squares"]);
+    const deco = decoKind === "circles"
+      ? `<circle cx="786" cy="212" r="95" fill="${P.soft}"/><circle cx="755" cy="274" r="44" fill="${P.accent}" opacity="0.9"/>`
+      : decoKind === "arc"
+      ? `<path d="M980 44 A 300 300 0 0 1 680 344 L 980 344 Z" fill="${P.soft}"/><circle cx="800" cy="220" r="30" fill="${P.accent}" opacity="0.9"/>`
+      : `<rect x="700" y="120" width="180" height="180" fill="none" stroke="${P.soft}" stroke-width="26"/><rect x="760" y="180" width="180" height="180" fill="none" stroke="${P.accent}" stroke-width="10" opacity="0.65"/>`;
+    defs = `<pattern id="dg" width="30" height="30" patternUnits="userSpaceOnUse"><circle cx="4" cy="4" r="3" fill="${P.dot}"/></pattern>`;
+    body = `<rect width="1024" height="1024" fill="${P.bg}"/>
+<rect x="44" y="44" width="936" height="936" fill="none" stroke="${P.line}" stroke-width="2"/>
+<path d="M44 76V44h32M948 44h32v32M44 948v32h32M980 948v32h-32" fill="none" stroke="${P.accent}" stroke-width="6"/>
+${deco}
+<rect x="651" y="740" width="260" height="180" fill="url(#dg)"/>`;
     if (withText) {
       const t = titleBlock(700, 3, 88, 34);
       const topY = 512 - t.blockH / 2;
       body += `
-<rect x="113" y="${(topY - 112).toFixed(0)}" width="74" height="74" rx="20" fill="#e8eefc"/>
-${glyphAt(129, topY - 96, 42, "#2563eb", 1.7)}
-<line x1="205" y1="${(topY - 75).toFixed(0)}" x2="790" y2="${(topY - 75).toFixed(0)}" stroke="#d7dce6" stroke-width="2"/>
-<text x="113" y="${(topY + t.fontSize).toFixed(0)}" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-2" fill="#111827">${tspans(t.lines, 113, t.lh)}</text>
-<rect x="113" y="${(topY + t.blockH + 44).toFixed(0)}" width="170" height="10" fill="#2563eb"/>`;
+<rect x="113" y="${(topY - 112).toFixed(0)}" width="74" height="74" rx="20" fill="${P.soft}"/>
+${glyphAt(129, topY - 96, 42, P.accent, 1.7)}
+<line x1="205" y1="${(topY - 75).toFixed(0)}" x2="790" y2="${(topY - 75).toFixed(0)}" stroke="${P.line}" stroke-width="2"/>
+<text x="113" y="${(topY + t.fontSize).toFixed(0)}" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-2" fill="${P.ink}">${tspans(t.lines, 113, t.lh)}</text>
+<rect x="113" y="${(topY + t.blockH + 44).toFixed(0)}" width="170" height="10" fill="${P.accent}"/>`;
     } else {
       body += `
-<rect x="113" y="180" width="74" height="74" rx="20" fill="#e8eefc"/>
-${glyphAt(129, 196, 42, "#2563eb", 1.7)}
-<line x1="205" y1="217" x2="640" y2="217" stroke="#d7dce6" stroke-width="2"/>
-<rect x="113" y="770" width="170" height="10" fill="#2563eb"/>`;
+<rect x="113" y="180" width="74" height="74" rx="20" fill="${P.soft}"/>
+${glyphAt(129, 196, 42, P.accent, 1.7)}
+<line x1="205" y1="217" x2="640" y2="217" stroke="${P.line}" stroke-width="2"/>
+<rect x="113" y="770" width="170" height="10" fill="${P.accent}"/>`;
     }
   } else if (style === "typography") {
-    const ghostSrc = (withText ? dTitle.replace(/\n/g, " ") : s);
-    const gRows = [110, 314, 518, 722, 926].map((y, i) =>
-      `<text x="${i % 2 ? 1016 : 8}" y="${y}" text-anchor="${i % 2 ? "end" : "start"}" font-family="${FONT_STACK}" font-size="118" font-weight="800" letter-spacing="-2" fill="none" stroke="${i % 2 ? "rgba(148,163,184,0.13)" : "rgba(251,146,60,0.16)"}" stroke-width="2">${esc(ghostSrc)}</text>`
+    const P = R([
+      { bg: "#101623", ink: "#f8fafc", accent: "#fb923c", g1: "rgba(251,146,60,0.16)", g2: "rgba(148,163,184,0.13)" },
+      { bg: "#0d1b2a", ink: "#f0f9ff", accent: "#38bdf8", g1: "rgba(56,189,248,0.15)", g2: "rgba(148,163,184,0.12)" },
+      { bg: "#1a1216", ink: "#fdf2f8", accent: "#f472b6", g1: "rgba(244,114,182,0.15)", g2: "rgba(168,162,158,0.12)" },
+      { bg: "#f5f1e8", ink: "#1c1917", accent: "#dc2626", g1: "rgba(28,25,23,0.10)", g2: "rgba(220,38,38,0.10)" },
+    ]);
+    const ghostSrc = withText ? dTitle.replace(/\n/g, " ") : s;
+    const rowYs = R([[110, 314, 518, 722, 926], [140, 380, 620, 860], [90, 260, 430, 600, 770, 940]]);
+    const gRows = rowYs.map((y, i) =>
+      `<text x="${i % 2 ? 1016 : 8}" y="${y}" text-anchor="${i % 2 ? "end" : "start"}" font-family="${FONT_STACK}" font-size="118" font-weight="800" letter-spacing="-2" fill="none" stroke="${i % 2 ? P.g2 : P.g1}" stroke-width="2">${esc(ghostSrc)}</text>`
     ).join("");
-    body = `<rect width="1024" height="1024" fill="#101623"/>${gRows}`;
+    body = `<rect width="1024" height="1024" fill="${P.bg}"/>${gRows}`;
     if (withText) {
       const t = titleBlock(840, 3, 118, 40);
       const topY = 512 - t.blockH / 2;
+      const shadow = P.bg === "#f5f1e8" ? "" : `text-shadow: none;`;
       body += `
-<rect x="92" y="${(topY - 54).toFixed(0)}" width="120" height="12" rx="6" fill="#fb923c"/>
-<text x="92" y="${(topY + t.fontSize).toFixed(0)}" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-3" fill="#f8fafc">${tspans(t.lines, 92, t.lh)}</text>
-<line x1="92" y1="${(topY + t.blockH + 46).toFixed(0)}" x2="312" y2="${(topY + t.blockH + 46).toFixed(0)}" stroke="rgba(248,250,252,0.35)" stroke-width="4"/>
-<circle cx="326" cy="${(topY + t.blockH + 46).toFixed(0)}" r="7" fill="#fb923c"/>`;
+<rect x="92" y="${(topY - 54).toFixed(0)}" width="120" height="12" rx="6" fill="${P.accent}"/>
+<text x="92" y="${(topY + t.fontSize).toFixed(0)}" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-3" fill="${P.ink}">${tspans(t.lines, 92, t.lh)}</text>
+<line x1="92" y1="${(topY + t.blockH + 46).toFixed(0)}" x2="312" y2="${(topY + t.blockH + 46).toFixed(0)}" stroke="${P.ink}" stroke-opacity="0.35" stroke-width="4"/>
+<circle cx="326" cy="${(topY + t.blockH + 46).toFixed(0)}" r="7" fill="${P.accent}"/>`;
     } else {
       body += `
-<rect x="92" y="238" width="120" height="12" rx="6" fill="#fb923c"/>
-<line x1="92" y1="780" x2="312" y2="780" stroke="rgba(248,250,252,0.35)" stroke-width="4"/>
-<circle cx="326" cy="780" r="7" fill="#fb923c"/>`;
+<rect x="92" y="238" width="120" height="12" rx="6" fill="${P.accent}"/>
+<line x1="92" y1="780" x2="312" y2="780" stroke="${P.ink}" stroke-opacity="0.35" stroke-width="4"/>
+<circle cx="326" cy="780" r="7" fill="${P.accent}"/>`;
     }
   } else if (style === "branding") {
-    defs = `<radialGradient id="bgr" cx="50%" cy="30%" r="80%"><stop offset="0%" stop-color="#2a1035"/><stop offset="55%" stop-color="#120a1d"/><stop offset="100%" stop-color="#090e18"/></radialGradient>
-<linearGradient id="gbar" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f43f5e"/><stop offset="1" stop-color="#a855f7"/></linearGradient>
-<linearGradient id="badge" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="rgba(244,63,94,0.25)"/><stop offset="1" stop-color="rgba(168,85,247,0.25)"/></linearGradient>
+    const P = R([
+      { c1: "#f43f5e", c2: "#a855f7", bgA: "#2a1035", bgB: "#120a1d", bgC: "#090e18" },
+      { c1: "#38bdf8", c2: "#2dd4bf", bgA: "#0c2740", bgB: "#0a1626", bgC: "#070e18" },
+      { c1: "#f59e0b", c2: "#f43f5e", bgA: "#301a06", bgB: "#1c1006", bgC: "#120a04" },
+      { c1: "#34d399", c2: "#22d3ee", bgA: "#0a2e22", bgB: "#081a14", bgC: "#06110d" },
+    ]);
+    const glowCenter = R(["50% 30%", "38% 40%", "62% 35%"]);
+    const rgba = (hex, a) => {
+      const n = parseInt(hex.slice(1), 16);
+      return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+    };
+    defs = `<radialGradient id="bgr" cx="${glowCenter.split(" ")[0]}" cy="${glowCenter.split(" ")[1]}" r="80%"><stop offset="0%" stop-color="${P.bgA}"/><stop offset="55%" stop-color="${P.bgB}"/><stop offset="100%" stop-color="${P.bgC}"/></radialGradient>
+<linearGradient id="gbar" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="${P.c1}"/><stop offset="1" stop-color="${P.c2}"/></linearGradient>
+<linearGradient id="badge" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${rgba(P.c1, 0.25)}"/><stop offset="1" stop-color="${rgba(P.c2, 0.25)}"/></linearGradient>
 <filter id="glow" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="34"/></filter>`;
+    const rings = R([
+      `<circle cx="60" cy="60" r="137" fill="none" stroke="${rgba(P.c1, 0.28)}" stroke-width="26"/><circle cx="964" cy="964" r="120" fill="none" stroke="${rgba(P.c2, 0.30)}" stroke-width="20"/>`,
+      `<circle cx="964" cy="60" r="137" fill="none" stroke="${rgba(P.c2, 0.28)}" stroke-width="26"/><circle cx="60" cy="964" r="120" fill="none" stroke="${rgba(P.c1, 0.30)}" stroke-width="20"/>`,
+      `<circle cx="512" cy="-60" r="150" fill="none" stroke="${rgba(P.c1, 0.22)}" stroke-width="30"/><circle cx="80" cy="920" r="100" fill="none" stroke="${rgba(P.c2, 0.28)}" stroke-width="18"/>`,
+    ]);
     body = `<rect width="1024" height="1024" fill="url(#bgr)"/>
-<circle cx="60" cy="60" r="137" fill="none" stroke="rgba(244,63,94,0.28)" stroke-width="26"/>
-<circle cx="964" cy="964" r="120" fill="none" stroke="rgba(168,85,247,0.30)" stroke-width="20"/>
-<circle cx="164" cy="798" r="7" fill="#f43f5e"/><circle cx="840" cy="246" r="5" fill="#a855f7"/>
+${rings}
+<circle cx="164" cy="798" r="7" fill="${P.c1}"/><circle cx="840" cy="246" r="5" fill="${P.c2}"/>
 <circle cx="758" cy="870" r="4" fill="rgba(255,255,255,0.6)"/><circle cx="246" cy="174" r="4" fill="rgba(255,255,255,0.45)"/>`;
     if (withText) {
       const t = titleBlock(800, 3, 92, 36);
@@ -885,7 +918,7 @@ ${glyphAt(129, 196, 42, "#2563eb", 1.7)}
       const subY = y + 30 + sf;
       y += subH + 48;
       body += `
-<circle cx="512" cy="${badgeCy.toFixed(0)}" r="80" fill="rgba(244,63,94,0.35)" filter="url(#glow)"/>
+<circle cx="512" cy="${badgeCy.toFixed(0)}" r="80" fill="${rgba(P.c1, 0.35)}" filter="url(#glow)"/>
 <circle cx="512" cy="${badgeCy.toFixed(0)}" r="64" fill="url(#badge)" stroke="rgba(255,255,255,0.25)" stroke-width="2"/>
 ${glyphAt(480, badgeCy - 32, 64, "#ffffff", 1.6)}
 <text x="512" y="${titleY.toFixed(0)}" text-anchor="middle" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-2.5" fill="#ffffff">${tspans(t.lines, 512, t.lh)}</text>
@@ -893,24 +926,55 @@ ${sl.length ? `<text x="512" y="${subY.toFixed(0)}" text-anchor="middle" font-fa
 <rect x="397" y="${y.toFixed(0)}" width="230" height="12" rx="6" fill="url(#gbar)"/>`;
     } else {
       body += `
-<circle cx="512" cy="190" r="80" fill="rgba(244,63,94,0.35)" filter="url(#glow)"/>
+<circle cx="512" cy="190" r="80" fill="${rgba(P.c1, 0.35)}" filter="url(#glow)"/>
 <circle cx="512" cy="190" r="64" fill="url(#badge)" stroke="rgba(255,255,255,0.25)" stroke-width="2"/>
 ${glyphAt(480, 158, 64, "#ffffff", 1.6)}
 <rect x="397" y="800" width="230" height="12" rx="6" fill="url(#gbar)"/>`;
     }
   } else if (style === "photo_realistic") {
-    defs = `<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0e2233"/><stop offset="45%" stop-color="#14424b"/><stop offset="72%" stop-color="#3c6d55"/><stop offset="100%" stop-color="#c2803f"/></linearGradient>
-<filter id="sunglow" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="30"/></filter>`;
+    // 풍경 3종: 석양 산맥 / 밤하늘 / 바다 수평선
+    const scene = R(["sunset", "night", "sea"]);
     const poly = (hPct, pts) => {
       const top = 1024 - 1024 * hPct;
       return pts.map(([px, py]) => `${(px * 10.24).toFixed(1)},${(top + py * 10.24 * hPct).toFixed(1)}`).join(" ");
     };
-    const m1 = poly(0.52, [[0,100],[0,62],[16,38],[30,58],[46,26],[60,52],[74,34],[88,56],[100,44],[100,100]]);
-    const m2 = poly(0.40, [[0,100],[0,70],[12,52],[26,68],[40,44],[58,72],[72,52],[86,70],[100,58],[100,100]]);
-    body = `<rect width="1024" height="1024" fill="url(#sky)"/>
+    const m1pts = [[0,100],[0,62],[16,38],[30,58],[46,26],[60,52],[74,34],[88,56],[100,44],[100,100]];
+    const m2pts = [[0,100],[0,70],[12,52],[26,68],[40,44],[58,72],[72,52],[86,70],[100,58],[100,100]];
+    let ink = "#f0fdf4";
+    if (scene === "night") {
+      ink = "#e2e8f0";
+      const stars = Array.from({ length: 26 }, (_, i) => {
+        const sx = (i * 197 + 83) % 1024, sy = (i * 131 + 47) % 520;
+        return `<circle cx="${sx}" cy="${sy}" r="${(i % 3) + 1.5}" fill="rgba(226,232,240,${0.35 + (i % 4) * 0.15})"/>`;
+      }).join("");
+      defs = `<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#070b1a"/><stop offset="55%" stop-color="#14204a"/><stop offset="100%" stop-color="#28407e"/></linearGradient>
+<filter id="sunglow" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="26"/></filter>`;
+      body = `<rect width="1024" height="1024" fill="url(#sky)"/>${stars}
+<circle cx="740" cy="210" r="100" fill="rgba(226,232,240,0.35)" filter="url(#sunglow)"/>
+<circle cx="740" cy="210" r="72" fill="#e2e8f0"/>
+<circle cx="712" cy="188" r="14" fill="rgba(148,163,184,0.5)"/><circle cx="762" cy="232" r="9" fill="rgba(148,163,184,0.4)"/>
+<polygon points="${poly(0.46, m1pts)}" fill="#0e1630"/><polygon points="${poly(0.34, m2pts)}" fill="#060b1c"/>`;
+    } else if (scene === "sea") {
+      ink = "#fef3e2";
+      defs = `<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#13324a"/><stop offset="58%" stop-color="#2a6f97"/><stop offset="100%" stop-color="#f4a261"/></linearGradient>
+<linearGradient id="seag" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0e4a68"/><stop offset="100%" stop-color="#0a3350"/></linearGradient>
+<filter id="sunglow" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="30"/></filter>`;
+      body = `<rect width="1024" height="628" fill="url(#sky)"/>
+<circle cx="512" cy="560" r="130" fill="rgba(252,211,77,0.5)" filter="url(#sunglow)"/>
+<circle cx="512" cy="560" r="90" fill="#fcd34d"/>
+<rect y="628" width="1024" height="396" fill="url(#seag)"/>
+<rect x="430" y="650" width="164" height="8" rx="4" fill="rgba(252,211,77,0.55)"/>
+<rect x="452" y="690" width="120" height="6" rx="3" fill="rgba(252,211,77,0.4)"/>
+<rect x="472" y="726" width="80" height="5" rx="2.5" fill="rgba(252,211,77,0.3)"/>
+<rect x="410" y="760" width="204" height="4" rx="2" fill="rgba(252,211,77,0.22)"/>`;
+    } else {
+      defs = `<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0e2233"/><stop offset="45%" stop-color="#14424b"/><stop offset="72%" stop-color="#3c6d55"/><stop offset="100%" stop-color="#c2803f"/></linearGradient>
+<filter id="sunglow" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="30"/></filter>`;
+      body = `<rect width="1024" height="1024" fill="url(#sky)"/>
 <circle cx="760" cy="220" r="120" fill="rgba(252,211,77,0.45)" filter="url(#sunglow)"/>
 <circle cx="760" cy="220" r="85" fill="#fcd34d"/>
-<polygon points="${m1}" fill="#1d3a30"/><polygon points="${m2}" fill="#122620"/>`;
+<polygon points="${poly(0.52, m1pts)}" fill="#1d3a30"/><polygon points="${poly(0.40, m2pts)}" fill="#122620"/>`;
+    }
     if (withText) {
       const t = titleBlock(700, 2, 56, 28);
       const sf = fixedSubPx > 0 ? fixedSubPx : 25;
@@ -922,23 +986,31 @@ ${glyphAt(480, 158, 64, "#ffffff", 1.6)}
       const subY = capY + 42 + (Math.max(104, contentH) - contentH) / 2 + t.blockH + 14 + sf;
       body += `
 <rect x="61" y="${capY.toFixed(0)}" width="902" height="${capH.toFixed(0)}" rx="26" fill="rgba(8,16,14,0.55)" stroke="rgba(255,255,255,0.12)"/>
-<text x="107" y="${titleY.toFixed(0)}" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-1.5" fill="#f0fdf4">${tspans(t.lines, 107, t.lh)}</text>
-${sl.length ? `<text x="107" y="${subY.toFixed(0)}" font-family="${FONT_STACK}" font-size="${sf}" fill="rgba(240,253,244,0.8)">${sl.map((ln, i) => `<tspan x="107" dy="${i === 0 ? 0 : sf * 1.45}">${esc(ln)}</tspan>`).join("")}</text>` : ""}
+<text x="107" y="${titleY.toFixed(0)}" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-1.5" fill="${ink}">${tspans(t.lines, 107, t.lh)}</text>
+${sl.length ? `<text x="107" y="${subY.toFixed(0)}" font-family="${FONT_STACK}" font-size="${sf}" fill="${ink}" fill-opacity="0.8">${sl.map((ln, i) => `<tspan x="107" dy="${i === 0 ? 0 : sf * 1.45}">${esc(ln)}</tspan>`).join("")}</text>` : ""}
 <rect x="817" y="${(capY + (capH - 104) / 2).toFixed(0)}" width="104" height="104" rx="24" fill="rgba(255,255,255,0.12)"/>
-${glyphAt(841, capY + (capH - 104) / 2 + 24, 56, "#f0fdf4", 1.6)}`;
+${glyphAt(841, capY + (capH - 104) / 2 + 24, 56, ink, 1.6)}`;
     } else {
       body += `
 <rect x="858" y="856" width="104" height="104" rx="24" fill="rgba(255,255,255,0.12)"/>
-${glyphAt(882, 880, 56, "#f0fdf4", 1.6)}`;
+${glyphAt(882, 880, 56, ink, 1.6)}`;
     }
   } else { // poster (기본)
-    defs = `<linearGradient id="pbg" x1="0" y1="0" x2="1" y2="0.6"><stop offset="0%" stop-color="#0b1226"/><stop offset="55%" stop-color="#132a54"/><stop offset="100%" stop-color="#1e3a8a"/></linearGradient>
-<linearGradient id="rib" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f97316"/><stop offset="1" stop-color="#fb5f2a"/></linearGradient>
-<pattern id="pd" width="34" height="34" patternUnits="userSpaceOnUse"><circle cx="4" cy="4" r="3" fill="rgba(148,197,255,0.45)"/></pattern>`;
+    const P = R([
+      { a: "#0b1226", b: "#132a54", c: "#1e3a8a", accent: "#38bdf8", rib1: "#f97316", rib2: "#fb5f2a", ghost: "#93c5fd", dot: "rgba(148,197,255,0.45)", ink: "#f8fafc" },
+      { a: "#160b26", b: "#2d1454", c: "#5b21b6", accent: "#e879f9", rib1: "#facc15", rib2: "#f59e0b", ghost: "#d8b4fe", dot: "rgba(216,180,254,0.45)", ink: "#faf5ff" },
+      { a: "#052019", b: "#0a3d2e", c: "#0f766e", accent: "#fbbf24", rib1: "#f43f5e", rib2: "#e11d48", ghost: "#6ee7b7", dot: "rgba(110,231,183,0.45)", ink: "#f0fdf4" },
+      { a: "#1f0a0a", b: "#4c1212", c: "#991b1b", accent: "#fde047", rib1: "#f97316", rib2: "#ea580c", ghost: "#fca5a5", dot: "rgba(252,165,165,0.45)", ink: "#fff7ed" },
+    ]);
+    const ribAngle = R([-7, 7, -11]);
+    const ghostRight = R([true, true, false]);
+    defs = `<linearGradient id="pbg" x1="0" y1="0" x2="1" y2="0.6"><stop offset="0%" stop-color="${P.a}"/><stop offset="55%" stop-color="${P.b}"/><stop offset="100%" stop-color="${P.c}"/></linearGradient>
+<linearGradient id="rib" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="${P.rib1}"/><stop offset="1" stop-color="${P.rib2}"/></linearGradient>
+<pattern id="pd" width="34" height="34" patternUnits="userSpaceOnUse"><circle cx="4" cy="4" r="3" fill="${P.dot}"/></pattern>`;
     body = `<rect width="1024" height="1024" fill="url(#pbg)"/>
-<rect x="655" y="72" width="300" height="220" fill="url(#pd)"/>
-${glyphAt(590, 164, 560, "#93c5fd", 1.1, 0.14)}
-<g transform="rotate(-7 512 512)"><rect x="-100" y="742" width="1224" height="118" fill="url(#rib)" opacity="0.92"/><rect x="-100" y="906" width="1224" height="26" fill="#38bdf8" opacity="0.75"/></g>`;
+<rect x="${ghostRight ? 655 : 69}" y="72" width="300" height="220" fill="url(#pd)"/>
+${glyphAt(ghostRight ? 590 : -126, 164, 560, P.ghost, 1.1, 0.14)}
+<g transform="rotate(${ribAngle} 512 512)"><rect x="-100" y="742" width="1224" height="118" fill="url(#rib)" opacity="0.92"/><rect x="-100" y="906" width="1224" height="26" fill="${P.accent}" opacity="0.75"/></g>`;
     if (withText) {
       const t = titleBlock(740, 3, 104, 40);
       const titleY = 246 + 12 + 40 + t.fontSize;
@@ -946,16 +1018,16 @@ ${glyphAt(590, 164, 560, "#93c5fd", 1.1, 0.14)}
       const sl = subLines(740, sf);
       const subY = 246 + 12 + 40 + t.blockH + 26 + sf;
       body += `
-<rect x="82" y="246" width="120" height="12" rx="6" fill="#38bdf8"/>
-<text x="82" y="${titleY.toFixed(0)}" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-2.5" fill="#f8fafc">${tspans(t.lines, 82, t.lh)}</text>
-${sl.length ? `<text x="82" y="${subY.toFixed(0)}" font-family="${FONT_STACK}" font-size="${sf}" fill="rgba(248,250,252,0.85)">${sl.map((ln, i) => `<tspan x="82" dy="${i === 0 ? 0 : sf * 1.5}">${esc(ln)}</tspan>`).join("")}</text>` : ""}`;
+<rect x="82" y="246" width="120" height="12" rx="6" fill="${P.accent}"/>
+<text x="82" y="${titleY.toFixed(0)}" font-family="${FONT_STACK}" font-size="${t.fontSize}" font-weight="800" letter-spacing="-2.5" fill="${P.ink}">${tspans(t.lines, 82, t.lh)}</text>
+${sl.length ? `<text x="82" y="${subY.toFixed(0)}" font-family="${FONT_STACK}" font-size="${sf}" fill="${P.ink}" fill-opacity="0.85">${sl.map((ln, i) => `<tspan x="82" dy="${i === 0 ? 0 : sf * 1.5}">${esc(ln)}</tspan>`).join("")}</text>` : ""}`;
     } else {
       body += `
-<rect x="82" y="216" width="120" height="12" rx="6" fill="#38bdf8"/>`;
+<rect x="82" y="216" width="120" height="12" rx="6" fill="${P.accent}"/>`;
     }
     body += `
 <rect x="82" y="866" width="92" height="92" rx="24" fill="rgba(255,255,255,0.12)" stroke="rgba(255,255,255,0.18)"/>
-${glyphAt(102, 886, 52, "#f8fafc", 1.6)}`;
+${glyphAt(102, 886, 52, P.ink, 1.6)}`;
   }
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 1024 1024" preserveAspectRatio="xMidYMid slice">
