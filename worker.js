@@ -1229,9 +1229,86 @@ POST /api/image  {"prompt":"...","width":1024,"height":1024}</pre>
 <p>Google은 자동화 차단 때문에 뉴스 RSS 기반이라 결과가 뉴스 기사로 한정됩니다. 이미지 생성은 Cloudflare Workers AI 바인딩이 켜져 있어야 실제 AI 이미지가 나오고, 없으면 SVG 카드로 대체됩니다.</p>
 </main></body></html>`;
 
+/* ── 플러그인 업데이트 서버 (/api/plugin/*) ─────────────
+   탐색허브 플러그인의 "설치자 전용 자동 업데이트"를 담당한다.
+   - 허용 목록(ALLOWED_SITES)에 있는 사이트만 응답 — 설치를 허락한 사람만 업데이트
+   - 최신 버전 정보/zip은 비공개 GitHub 저장소의 릴리스에서 가져온다
+     (GITHUB_TOKEN 시크릿 필요 — 업데이트 서버 역할을 하는 워커에만 등록)
+   - 이 경로는 X-AIBP-Secret 검사에서 제외한다: 설치자들은 이 워커의 비밀키를
+     모르며, 접근 제어는 허용 목록이 담당한다 (뉴런을 쓰는 API도 아니다) */
+
+const PLUGIN_REPO = "azit4u/tamsaekpack";
+
+// 업데이트를 허용할 사이트 도메인 — 새 설치자를 승인하려면 여기에 추가하고
+// 푸시하면 된다 (자동 배포). www.은 붙이지 않는다.
+const ALLOWED_SITES = [
+  "giirok.com",
+];
+
+function pluginSiteAllowed(raw) {
+  try {
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : "https://" + raw);
+    return ALLOWED_SITES.includes(u.hostname.replace(/^www\./, "").toLowerCase());
+  } catch { return false; }
+}
+
+async function ghLatestRelease(env) {
+  const res = await fetch(`https://api.github.com/repos/${PLUGIN_REPO}/releases/latest`, {
+    headers: {
+      "Authorization": "Bearer " + env.GITHUB_TOKEN,
+      "Accept": "application/vnd.github+json",
+      "User-Agent": "tamsaek-worker",
+    },
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+async function handlePluginLatest(request, env) {
+  const site = new URL(request.url).searchParams.get("site") || "";
+  if (!pluginSiteAllowed(site)) return json({ error: "unregistered_site", message: "허용되지 않은 사이트입니다." }, 403);
+  if (!env || !env.GITHUB_TOKEN) return json({ error: "not_configured", message: "이 워커에는 업데이트 서버가 설정되지 않았습니다 (GITHUB_TOKEN 없음)." }, 503);
+  const rel = await ghLatestRelease(env);
+  if (!rel || !rel.tag_name) return json({ error: "no_release", message: "릴리스를 찾지 못했습니다." }, 502);
+  return json({
+    version: String(rel.tag_name).replace(/^v/i, ""),
+    name: rel.name || rel.tag_name,
+    notes: String(rel.body || "").slice(0, 4000),
+    published_at: rel.published_at || "",
+  });
+}
+
+async function handlePluginDownload(request, env) {
+  const site = new URL(request.url).searchParams.get("site") || "";
+  if (!pluginSiteAllowed(site)) return json({ error: "unregistered_site", message: "허용되지 않은 사이트입니다." }, 403);
+  if (!env || !env.GITHUB_TOKEN) return json({ error: "not_configured" }, 503);
+  const rel = await ghLatestRelease(env);
+  const asset = rel && Array.isArray(rel.assets) ? rel.assets.find((a) => /\.zip$/i.test(a.name)) : null;
+  if (!asset) return json({ error: "no_asset", message: "릴리스에 zip 파일이 없습니다." }, 502);
+  const res = await fetch(asset.url, {
+    headers: {
+      "Authorization": "Bearer " + env.GITHUB_TOKEN,
+      "Accept": "application/octet-stream",
+      "User-Agent": "tamsaek-worker",
+    },
+  });
+  if (!res.ok) return json({ error: "download_failed", status: res.status }, 502);
+  return new Response(res.body, {
+    headers: {
+      "Content-Type": "application/zip",
+      "Content-Disposition": `attachment; filename="${asset.name}"`,
+      ...CORS,
+    },
+  });
+}
+
 async function routeRequest(request, env) {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+
+  // 플러그인 업데이트 경로 — 비밀키 검사 없이 허용 목록으로만 통제
+  if (url.pathname === "/api/plugin/latest") return handlePluginLatest(request, env);
+  if (url.pathname === "/api/plugin/download") return handlePluginDownload(request, env);
 
   if (url.pathname.indexOf("/api/") === 0) {
     // 비밀키가 등록된 경우에만 검사한다 (미등록 시 개방).
