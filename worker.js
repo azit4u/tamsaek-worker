@@ -256,7 +256,12 @@ async function handleSearch(request) {
   const start = Math.max(0, parseInt(u.searchParams.get("start") || "0", 10) || 0);
 
   if (!q) return json({ error: "q 파라미터가 필요합니다. 예: /api/search?q=검색어&engine=all" }, 400);
-  const names = engine === "all" ? Object.keys(ENGINES) : engine.split(",").filter((n) => ENGINES[n]);
+  // all에서 bing(웹검색)은 제외 — Cloudflare IP로 오는 한국어 쿼리를 Bing이 무시하고
+  // 무관한 결과(외국어 문서 등)를 주는 일이 잦아(실측 2026-09-08) 그라운딩 자료를 오염시킨다.
+  // 필요하면 engine=bing으로 명시 호출은 여전히 가능. (google=뉴스 RSS의 Bing 뉴스 폴백은 정상이라 유지)
+  const names = engine === "all"
+    ? Object.keys(ENGINES).filter((n) => n !== "bing")
+    : engine.split(",").filter((n) => ENGINES[n]);
   if (!names.length) return json({ error: "engine은 all, naver, daum, bing, google 중 하나입니다." }, 400);
 
   const settled = await Promise.allSettled(names.map((n) => runEngine(n, q, start)));
@@ -452,8 +457,9 @@ async function handleResearch(request, env) {
   if (!query) return json({ error: "query가 필요합니다." }, 400);
   const maxResults = Math.max(3, Math.min(10, parseInt(body.max_results, 10) || 8));
 
-  // 빠른 엔진 3곳만 병렬 조사(뉴스 RSS는 조사 목적상 기여도가 낮고 느릴 수 있어 제외).
-  const names = ["naver", "daum", "bing"];
+  // 빠른 엔진 2곳만 병렬 조사(뉴스 RSS는 조사 목적상 기여도가 낮고 느릴 수 있어 제외,
+  // bing 웹검색은 무관한 결과 오염 문제로 제외 — /api/search의 all과 같은 이유).
+  const names = ["naver", "daum"];
   const settled = await Promise.allSettled(names.map((n) => runEngine(n, query, 0)));
   const providers = settled.map((s, i) => s.status === "fulfilled"
     ? s.value
