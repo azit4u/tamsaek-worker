@@ -34,12 +34,3 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets[matrix.account_id_secret] }}
-      # 업데이트 서버용 설치 키를 워커 시크릿으로 자동 동기화 (s2angh 계정만 —
-      # 업데이트 서버는 그 워커 하나다). 키 변경 = 저장소 시크릿 UPDATE_KEYS 수정
-      # 후 재배포. CF 대시보드를 손으로 만질 일이 없다.
-      - name: Sync update keys
-        if: matrix.account_name == 's2angh'
-        run: printf '%s' "${{ secrets.UPDATE_KEYS }}" | npx wrangler@4 secret put UPDATE_KEYS
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets[matrix.account_id_secret] }}

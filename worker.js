@@ -1229,83 +1229,9 @@ POST /api/image  {"prompt":"...","width":1024,"height":1024}</pre>
 <p>Google은 자동화 차단 때문에 뉴스 RSS 기반이라 결과가 뉴스 기사로 한정됩니다. 이미지 생성은 Cloudflare Workers AI 바인딩이 켜져 있어야 실제 AI 이미지가 나오고, 없으면 SVG 카드로 대체됩니다.</p>
 </main></body></html>`;
 
-/* ── 플러그인 업데이트 서버 (/api/plugin/*) ─────────────
-   탐색허브 플러그인의 "설치자 전용 자동 업데이트"를 담당한다.
-   - 유효한 설치 키(UPDATE_KEYS)를 보낸 요청만 응답 — 키는 zip과 함께 전달받은
-     사람만 가진다. 도메인 등록이 필요 없어 새 설치자에게 "zip+키"만 주면 끝.
-   - 최신 버전 정보/zip은 비공개 GitHub 저장소의 릴리스에서 가져온다
-     (GITHUB_TOKEN 시크릿 필요 — 업데이트 서버 역할을 하는 워커에만 등록)
-   - 이 경로는 X-AIBP-Secret 검사에서 제외한다: 설치자들은 이 워커의 비밀키를
-     모르며, 접근 제어는 설치 키가 담당한다 (뉴런을 쓰는 API도 아니다) */
-
-const PLUGIN_REPO = "azit4u/tamsaekpack";
-
-// 유효한 설치 키는 워커 시크릿 UPDATE_KEYS 에서 읽는다 (쉼표로 여러 개 가능).
-// ⚠️ 코드에 키를 적으면 안 된다 — 이 저장소는 공개이고, 자동 배포로 다른 계정
-// 워커에도 실리기 때문. 키 추가/삭제는 CF 대시보드에서 변수만 고치면 된다
-// (저장 시 다른 변수들이 목록에 다 있는지 확인 + 재배포 필요).
-function pluginKeyAllowed(request, env) {
-  const keys = String( ( env && env.UPDATE_KEYS ) || "" ).split( "," ).map( ( t ) => t.trim() ).filter( Boolean );
-  if ( ! keys.length ) return false; // 키 미설정 워커 = 업데이트 서버 아님
-  const k = new URL( request.url ).searchParams.get( "k" ) || "";
-  return keys.includes( k );
-}
-
-async function ghLatestRelease(env) {
-  const res = await fetch(`https://api.github.com/repos/${PLUGIN_REPO}/releases/latest`, {
-    headers: {
-      "Authorization": "Bearer " + env.GITHUB_TOKEN,
-      "Accept": "application/vnd.github+json",
-      "User-Agent": "tamsaek-worker",
-    },
-  });
-  if (!res.ok) return null;
-  return res.json();
-}
-
-async function handlePluginLatest(request, env) {
-  if (!pluginKeyAllowed(request, env)) return json({ error: "invalid_key", message: "유효하지 않은 설치 키입니다." }, 403);
-  if (!env || !env.GITHUB_TOKEN) return json({ error: "not_configured", message: "이 워커에는 업데이트 서버가 설정되지 않았습니다 (GITHUB_TOKEN 없음)." }, 503);
-  const rel = await ghLatestRelease(env);
-  if (!rel || !rel.tag_name) return json({ error: "no_release", message: "릴리스를 찾지 못했습니다." }, 502);
-  return json({
-    version: String(rel.tag_name).replace(/^v/i, ""),
-    name: rel.name || rel.tag_name,
-    notes: String(rel.body || "").slice(0, 4000),
-    published_at: rel.published_at || "",
-  });
-}
-
-async function handlePluginDownload(request, env) {
-  if (!pluginKeyAllowed(request, env)) return json({ error: "invalid_key", message: "유효하지 않은 설치 키입니다." }, 403);
-  if (!env || !env.GITHUB_TOKEN) return json({ error: "not_configured" }, 503);
-  const rel = await ghLatestRelease(env);
-  const asset = rel && Array.isArray(rel.assets) ? rel.assets.find((a) => /\.zip$/i.test(a.name)) : null;
-  if (!asset) return json({ error: "no_asset", message: "릴리스에 zip 파일이 없습니다." }, 502);
-  const res = await fetch(asset.url, {
-    headers: {
-      "Authorization": "Bearer " + env.GITHUB_TOKEN,
-      "Accept": "application/octet-stream",
-      "User-Agent": "tamsaek-worker",
-    },
-  });
-  if (!res.ok) return json({ error: "download_failed", status: res.status }, 502);
-  return new Response(res.body, {
-    headers: {
-      "Content-Type": "application/zip",
-      "Content-Disposition": `attachment; filename="${asset.name}"`,
-      ...CORS,
-    },
-  });
-}
-
 async function routeRequest(request, env) {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-
-  // 플러그인 업데이트 경로 — 비밀키 검사 없이 허용 목록으로만 통제
-  if (url.pathname === "/api/plugin/latest") return handlePluginLatest(request, env);
-  if (url.pathname === "/api/plugin/download") return handlePluginDownload(request, env);
 
   if (url.pathname.indexOf("/api/") === 0) {
     // 비밀키가 등록된 경우에만 검사한다 (미등록 시 개방).
