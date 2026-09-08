@@ -323,7 +323,11 @@ async function fetchArticleBody(item) {
     for (const mk of DEEP_BODY_MARKERS) {
       const idx = H.indexOf(mk);
       if (idx === -1) continue;
-      const body = htmlToText(H.slice(idx, idx + 90000)).trim();
+      // 마커는 여는 태그의 속성 한가운데라, 태그가 끝나는 '>' 다음부터 잘라야
+      // 태그 찌꺼기(id="..." class="...">)가 본문에 섞이지 않는다.
+      const chunk = H.slice(idx, idx + 90000);
+      const gt = chunk.indexOf(">");
+      const body = htmlToText(gt === -1 ? chunk : chunk.slice(gt + 1)).trim();
       if (body.length > 150) {
         return { title: item.title, url: item.url, source: item.source, content: body.slice(0, DEEP_BODY_CHARS) };
       }
