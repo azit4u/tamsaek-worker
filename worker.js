@@ -247,6 +247,112 @@ async function runEngine(name, q, start) {
   };
 }
 
+/* ── 심층 수집 (deep=1) ─────────────────────────────
+   자동화글쓰기 프로젝트의 리서처(researcher.py) 방식 이식:
+   ① 모바일 뉴스·블로그 "탭"을 정렬(관련도/최신)별로 나눠 링크를 모으고
+   ② 상위 글에 실제로 들어가 본문을 발췌해 온다.
+   네이버 뉴스/블로그(m.), 다음 뉴스는 서버 렌더링이라 브라우저 없이 본문이 잡힌다.
+   검색 스니펫 몇 줄 대신 실제 본문 수천 자가 그라운딩 재료가 되는 게 핵심. */
+
+const DEEP_URL_RES = {
+  naverNews: /https?:\/\/(?:n\.)?news\.naver\.com\/(?:mnews\/)?article\/\d+\/\d+/,
+  naverBlog: /https?:\/\/(?:m\.)?blog\.naver\.com\/[\w.-]+\/\d+/,
+  daumNews: /https?:\/\/v\.daum\.net\/v\/\w+/,
+};
+
+const DEEP_SOURCES = [
+  { name: "네이버 뉴스(관련도)", re: DEEP_URL_RES.naverNews,
+    url: (q) => `https://m.search.naver.com/search.naver?ssc=tab.m_news.all&where=m_news&sm=mtb_jum&query=${encodeURIComponent(q)}` },
+  { name: "네이버 뉴스(최신)", re: DEEP_URL_RES.naverNews,
+    url: (q) => `https://m.search.naver.com/search.naver?ssc=tab.m_news.all&where=m_news&sm=mtb_jum&query=${encodeURIComponent(q)}&sort=1` },
+  { name: "네이버 블로그", re: DEEP_URL_RES.naverBlog,
+    url: (q) => `https://m.search.naver.com/search.naver?ssc=tab.m_blog.all&sm=mtb_jum&query=${encodeURIComponent(q)}` },
+  { name: "다음 뉴스(최신)", re: DEEP_URL_RES.daumNews,
+    url: (q) => `https://m.search.daum.net/search?w=news&q=${encodeURIComponent(q)}&sort=recency&DA=STC` },
+];
+
+const DEEP_PER_SOURCE = 5;   // 탭당 수집 링크 수
+const DEEP_MAX_ARTICLES = 12; // 본문까지 따라 들어가는 최대 글 수 (서브요청 한도 고려)
+const DEEP_BODY_CHARS = 1200; // 글당 본문 발췌 길이
+
+/** 중복 판정용 URL 정규화 — 프로토콜·모바일(m.)·쿼리스트링·끝 슬래시 차이를 무시 */
+function normalizeArticleUrl(raw) {
+  try {
+    const p = new URL(raw);
+    return p.hostname.replace(/^m\./, "") + p.pathname.replace(/\/$/, "");
+  } catch { return String(raw); }
+}
+
+/** 검색 탭 HTML에서 패턴에 맞는 글 링크(+앵커 제목)를 뽑는다 */
+function collectDeepLinks(html, urlRe, max) {
+  const out = [];
+  const seen = new Set();
+  const re = /<a\b[^>]*href="([^"]+)"[^>]*>([\s\S]{0,600}?)<\/a>/g;
+  let m;
+  while ((m = re.exec(html)) !== null && out.length < max) {
+    const href = m[1].replace(/&amp;/g, "&");
+    const um = href.match(urlRe);
+    if (!um) continue;
+    const key = normalizeArticleUrl(um[0]);
+    if (seen.has(key)) continue;
+    const title = stripTags(m[2]).trim();
+    if (title.length < 8) continue; // 썸네일 이미지 등 제목 없는 앵커 제외
+    seen.add(key);
+    out.push({ title: title.slice(0, 120), url: um[0] });
+  }
+  return out;
+}
+
+/** 본문 후보 컨테이너 마커 — 앞에 있을수록 우선 (네이버 뉴스/블로그·다음 뉴스·일반) */
+const DEEP_BODY_MARKERS = ['id="dic_area"', "se-main-container", "article_view", "articleBody", "<article", "<main"];
+
+function htmlToText(s) {
+  return stripTags(String(s)
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " "));
+}
+
+/** 글 하나에 들어가 본문을 발췌한다 — 실패하면 null (수집 흐름은 계속) */
+async function fetchArticleBody(item) {
+  // 데스크톱 블로그 주소는 iframe 껍데기라 본문이 없다 → 모바일 주소로 변환 (리서처 방식)
+  const url = item.url.replace(/^https?:\/\/blog\.naver\.com\//, "https://m.blog.naver.com/");
+  try {
+    const { text } = await fetchText(url, 7000);
+    if (!text) return null;
+    const H = text.slice(0, 400000);
+    for (const mk of DEEP_BODY_MARKERS) {
+      const idx = H.indexOf(mk);
+      if (idx === -1) continue;
+      const body = htmlToText(H.slice(idx, idx + 90000)).trim();
+      if (body.length > 150) {
+        return { title: item.title, url: item.url, source: item.source, content: body.slice(0, DEEP_BODY_CHARS) };
+      }
+    }
+    const fallback = htmlToText(H.slice(0, 120000)).trim();
+    return fallback.length > 300
+      ? { title: item.title, url: item.url, source: item.source, content: fallback.slice(0, DEEP_BODY_CHARS) }
+      : null;
+  } catch { return null; }
+}
+
+/** 심층 수집 본체: 탭 4곳 병렬 → 링크 중복 제거 → 본문 병렬 발췌 */
+async function deepCollect(q) {
+  const pages = await Promise.allSettled(DEEP_SOURCES.map((s) => fetchText(s.url(q), 7000)));
+  const targets = [];
+  const seen = new Set();
+  pages.forEach((r, i) => {
+    if (r.status !== "fulfilled" || !r.value.text) return;
+    for (const l of collectDeepLinks(r.value.text, DEEP_SOURCES[i].re, DEEP_PER_SOURCE)) {
+      const key = normalizeArticleUrl(l.url);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      targets.push({ ...l, source: DEEP_SOURCES[i].name });
+    }
+  });
+  const bodies = await Promise.allSettled(targets.slice(0, DEEP_MAX_ARTICLES).map((t) => fetchArticleBody(t)));
+  return bodies.filter((b) => b.status === "fulfilled" && b.value).map((b) => b.value);
+}
+
 async function handleSearch(request) {
   const u = new URL(request.url);
   // 플러그인이 q 값을 이중 인코딩해 보내는 경우가 있어 한 번 더 디코드를 시도한다.
@@ -254,6 +360,7 @@ async function handleSearch(request) {
   if (/%[0-9a-fA-F]{2}/.test(q)) { try { q = decodeURIComponent(q); } catch { /* 그대로 사용 */ } }
   const engine = (u.searchParams.get("engine") || "all").toLowerCase();
   const start = Math.max(0, parseInt(u.searchParams.get("start") || "0", 10) || 0);
+  const deep = u.searchParams.get("deep") === "1";
 
   if (!q) return json({ error: "q 파라미터가 필요합니다. 예: /api/search?q=검색어&engine=all" }, 400);
   // all에서 bing(웹검색)은 제외 — Cloudflare IP로 오는 한국어 쿼리를 Bing이 무시하고
@@ -264,12 +371,17 @@ async function handleSearch(request) {
     : engine.split(",").filter((n) => ENGINES[n]);
   if (!names.length) return json({ error: "engine은 all, naver, daum, bing, google 중 하나입니다." }, 400);
 
+  // deep=1이면 탭별 링크 수집+본문 발췌를 스니펫 검색과 병렬로 돌린다 (실패해도 스니펫은 정상 반환)
+  const deepPromise = deep ? deepCollect(q).catch(() => []) : null;
+
   const settled = await Promise.allSettled(names.map((n) => runEngine(n, q, start)));
   const providers = settled.map((s, i) => s.status === "fulfilled"
     ? s.value
     : { engine: names[i], label: ENGINES[names[i]].label, upstream_status: 599, latency_ms: 0, results: [] });
 
-  return json({ query: q, engine, start, providers });
+  const payload = { query: q, engine, start, providers };
+  if (deepPromise) payload.articles = await deepPromise;
+  return json(payload);
 }
 
 /* ── /api/research ──────────────────────────────────
@@ -1105,7 +1217,8 @@ const DOCS_HTML = `<!doctype html><html lang="ko"><head><meta charset="utf-8"><m
 <style>body{font-family:system-ui,'Apple SD Gothic Neo',sans-serif;background:#0b1220;color:#e5e7eb;margin:0;padding:40px}main{max-width:760px;margin:auto;background:#111a2e;border:1px solid #24304d;border-radius:20px;padding:32px}code,pre{background:#0a0f1c;border:1px solid #24304d;border-radius:10px;padding:3px 8px}pre{display:block;padding:14px;overflow:auto}h1{font-size:22px}</style></head>
 <body><main><h1>tamsaek-worker 검색·이미지 API</h1>
 <p>탐색팩 플러그인용 검색 그라운딩 + AI 이미지 생성 워커입니다. 워드프레스 관리자 → AI 글쓰기 설정의 "검색 Worker 주소"에 이 주소를 넣으세요.</p>
-<pre>GET  /api/search?q=검색어&amp;engine=all   (naver·daum·bing·google 병렬)
+<pre>GET  /api/search?q=검색어&amp;engine=all   (naver·daum·google뉴스 병렬)
+GET  /api/search?q=검색어&amp;deep=1      (+뉴스·블로그 탭 상위 글 본문 발췌)
 POST /api/research  {"query":"주제"}   (썸네일용 주제 조사 JSON)
 POST /api/image  {"prompt":"...","width":1024,"height":1024}</pre>
 <p>engine 값: <code>all</code> <code>naver</code> <code>daum</code> <code>bing</code> <code>google</code> (쉼표로 조합 가능)</p>

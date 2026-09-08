@@ -126,8 +126,9 @@ AI 썸네일 배경 생성을 쓰려면 필요합니다. (검색만 쓸 거면 �
 
 ## 기술 정보 (개발자용)
 
-- `GET /api/search?q=검색어&engine=all` — engine: `all` `naver` `daum` `bing` `google` (쉼표 조합 가능)
+- `GET /api/search?q=검색어&engine=all` — engine: `all` `naver` `daum` `bing` `google` (쉼표 조합 가능. `all`은 bing 제외 — CF IP에서 한국어 쿼리를 무시하는 문제)
   - 응답: `{ providers: [ { engine, label, results: [{title, url, snippet}] } ] }`
+  - `&deep=1` — 모바일 뉴스탭(관련도·최신)·블로그탭·다음 뉴스탭에서 탭당 5개 링크를 모으고, 상위 최대 12개 글에 실제로 들어가 본문을 1,200자씩 발췌해 `articles: [{title, url, source, content}]`로 함께 반환 (그라운딩 심층 모드 — 몇 초 더 걸림)
 - `POST /api/research` — body `{"query":"주제"}` → `{ summary, results, research: { actual_meaning, visual_context, hero_shot, color_mood, key_visuals, category, emotional_tone, ... } }`
   - 썸네일 프롬프트용 주제 조사: 검색(네이버·다음·Bing 병렬) 후 규칙 기반 분석. Workers AI 바인딩이 있으면 소형 텍스트 모델 1회 호출로 정성 필드만 보강(실패 시 규칙 기반 결과 유지)
 - `GET|POST /api/image` — body `{"prompt":"...","style":"poster","width":1024,"height":1024}` → `{ data_url, provider, model }`
